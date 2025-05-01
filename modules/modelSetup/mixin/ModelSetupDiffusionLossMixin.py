@@ -6,7 +6,6 @@ from modules.module.HPSv2ScoreModel import HPSv2ScoreModel
 from modules.util.TrainProgress import TrainProgress
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.DiffusionScheduleCoefficients import DiffusionScheduleCoefficients
-from modules.util.enum.AlignPropLoss import AlignPropLoss
 from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
 from modules.util.loss.masked_loss import masked_losses
@@ -37,49 +36,14 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 		self.loss_tracker = LossTracker(window_size=100, use_mad=False)
 		self.dynamic_loss_strengthing = DynamicLossStrength()
 
-	def __align_prop_losses(
-		self,
-		batch: dict,
-		data: dict,
-		config: TrainConfig,
-		train_device: torch.device,
-	):
-		if self.__align_prop_loss_fn is None:
-			dtype = data["predicted"].dtype
-
-			match config.align_prop_loss:
-				case AlignPropLoss.HPS:
-					self.__align_prop_loss_fn = HPSv2ScoreModel(dtype)
-				case AlignPropLoss.AESTHETIC:
-					self.__align_prop_loss_fn = AestheticScoreModel()
-
-			self.__align_prop_loss_fn.to(device=train_device, dtype=dtype)
-			self.__align_prop_loss_fn.requires_grad_(False)
-			self.__align_prop_loss_fn.eval()
-
-		losses = 0
-
-		match config.align_prop_loss:
-			case AlignPropLoss.HPS:
-				with torch.autocast(
-					device_type=train_device.type, dtype=data["predicted"].dtype
-				):
-					losses = self.__align_prop_loss_fn(
-						data["predicted"], batch["prompt"], train_device
-					)
-			case AlignPropLoss.AESTHETIC:
-				losses = self.__align_prop_loss_fn(data["predicted"])
-
-		return losses * config.align_prop_weight
-
-	def __log_cosh_loss(
-			self,
-			pred: torch.Tensor,
-			target: torch.Tensor,
-	):
-		diff = pred - target
-		loss = diff + torch.nn.functional.softplus(-2.0*diff) - torch.log(torch.full(size=diff.size(), fill_value=2.0, dtype=torch.float32, device=diff.device))
-		return loss
+    def __log_cosh_loss(
+            self,
+            pred: torch.Tensor,
+            target: torch.Tensor,
+    ) -> Tensor:
+        diff = pred - target
+        loss = diff + torch.nn.functional.softplus(-2.0*diff) - torch.log(torch.full(size=diff.size(), fill_value=2.0, dtype=torch.float32, device=diff.device))
+        return loss
 
 	def __masked_losses(
 			self,
@@ -577,18 +541,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 			)
 			self.__sigmas = all_timesteps / num_timesteps
 
-		if data["loss_type"] == "align_prop":
-			losses = self.__align_prop_losses(batch, data, config, train_device)
-		else:
-			# TODO: don't disable masked loss functions when has_conditioning_image_input is true.
-			#  This breaks if only the VAE is trained, but was loaded from an inpainting checkpoint
-			if (
-				config.masked_training
-				and not config.model_type.has_conditioning_image_input()
-			):
-				losses = self.__masked_losses(batch, data, config)
-			else:
-				losses = self.__unmasked_losses(batch, data, config)
+        if data['loss_type'] == 'target':
+            # TODO: don't disable masked loss functions when has_conditioning_image_input is true.
+            #  This breaks if only the VAE is trained, but was loaded from an inpainting checkpoint
+            if config.masked_training and not config.model_type.has_conditioning_image_input():
+                losses = self.__masked_losses(batch, data, config)
+            else:
+                losses = self.__unmasked_losses(batch, data, config)
 
 		# Scale Losses by Batch and/or GA (if enabled)
 		losses = losses * batch_size_scale * gradient_accumulation_steps_scale

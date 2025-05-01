@@ -20,8 +20,8 @@ def lr_lambda_constant():
 
 
 def lr_lambda_linear(
-    scheduler_steps: int,
-    min_factor: float = 1.0,
+        scheduler_steps: int,
+        min_factor: float = 1.0,
 ):
     def lr_lambda(current_step: int):
         lin_val = max(0.0, float(scheduler_steps - current_step) / float(scheduler_steps))
@@ -33,8 +33,8 @@ def lr_lambda_linear(
 
 
 def lr_lambda_cosine(
-    scheduler_steps: int,
-    min_factor: float = 1.0,
+        scheduler_steps: int,
+        min_factor: float = 1.0,
 ):
     def lr_lambda(current_step: int):
         progress = float(current_step) / float(scheduler_steps)
@@ -47,9 +47,9 @@ def lr_lambda_cosine(
 
 
 def lr_lambda_cosine_with_restarts(
-    scheduler_steps: int,
-    num_cycles: float,
-    min_factor: float = 1.0,
+        scheduler_steps: int,
+        num_cycles: float,
+        min_factor: float = 1.0,
 ):
     def lr_lambda(current_step: int):
         progress = float(min(current_step, scheduler_steps - 1)) / float(scheduler_steps)
@@ -63,9 +63,9 @@ def lr_lambda_cosine_with_restarts(
 
 
 def lr_lambda_cosine_with_hard_restarts(
-    scheduler_steps: int,
-    num_cycles: float,
-    min_factor: float = 1.0,
+        scheduler_steps: int,
+        num_cycles: float,
+        min_factor: float = 1.0,
 ):
     def lr_lambda(current_step: int):
         progress = float(min(current_step, scheduler_steps - 1)) / float(scheduler_steps)
@@ -79,8 +79,8 @@ def lr_lambda_cosine_with_hard_restarts(
 
 
 def lr_lambda_rex(
-    scheduler_steps: int,
-    min_factor: float = 1.0,
+        scheduler_steps: int,
+        min_factor: float = 1.0,
 ):
     def lr_lambda(current_step: int):
         max_lr = 1
@@ -92,11 +92,15 @@ def lr_lambda_rex(
             val = min_lr + (max_lr - min_lr) * ((1 - progress) / div)
         else:
             val = min_lr
-        
+
         factor = apply_min_factor(val, min_factor)
         return factor
 
     return lr_lambda
+
+
+def apply_min_factor(value: float, min_factor: float) -> float:
+    return min_factor + (1.0 - min_factor) * value
 
 
 def apply_min_factor(value: float, min_factor: float) -> float:

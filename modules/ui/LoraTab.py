@@ -1,7 +1,9 @@
 from pathlib import Path
 
 from modules.modelSetup.FluxLoRASetup import PRESETS as flux_presets
+from modules.modelSetup.HunyuanVideoLoRASetup import PRESETS as hunyuan_video_presets
 from modules.modelSetup.PixArtAlphaLoRASetup import PRESETS as pixart_presets
+from modules.modelSetup.SanaLoRASetup import PRESETS as sana_presets
 from modules.modelSetup.StableDiffusion3LoRASetup import PRESETS as sd3_presets
 from modules.modelSetup.StableDiffusionLoRASetup import PRESETS as sd_presets
 from modules.modelSetup.StableDiffusionXLLoRASetup import PRESETS as sdxl_presets
@@ -52,6 +54,10 @@ class LoraTab:
             self.presets = pixart_presets
         elif self.train_config.model_type.is_flux():
             self.presets = flux_presets
+        elif self.train_config.model_type.is_sana():
+            self.presets = sana_presets
+        elif self.train_config.model_type.is_hunyuan_video():
+            self.presets = hunyuan_video_presets
         else:
             self.presets = {"full": []}
         self.presets_list = list(self.presets.keys()) + ["custom"]
@@ -106,6 +112,9 @@ class LoraTab:
             components.label(master, 2, 3, "Use Norm Espilon (DoRA Only)",
                              tooltip="Add an epsilon to the norm divison calculation in DoRA. Can aid in training stability, and also acts as regularization.")
             components.switch(master, 2, 4, self.ui_state, "lora_decompose_norm_epsilon")
+            components.label(master, 3, 3, "Apply on output axis (DoRA Only)",
+                             tooltip="Apply the weight decomposition on the output axis instead of the input axis.")
+            components.switch(master, 3, 4, self.ui_state, "lora_decompose_output_axis")
 
         # lora rank
         components.label(master, 2, 0, f"{name} alpha",
