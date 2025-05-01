@@ -1,4 +1,8 @@
-# development
+!venv/Lib/
+!venv/Lib/site-packages/
+!venv/Lib/site-packages/prodigyopt/
+/venv
+
 .idea
 *.bak
 *.pyc
@@ -12,12 +16,20 @@ debug*.py
 /workspace*
 /models*
 /training_concepts
+/training_presets
 /training_samples
+/training_deltas
 /training_user_settings
 /external
 /update.var
 config.json
 secrets.json
+extLayers.py
+extPt.py
+fixLora.py
+fixPt.py
+limpaLayer.py
+*.txt
 
 # environments
 /.venv*
@@ -35,3 +47,4 @@ pixi.toml
 /src
 train.bat
 debug_report.log
+secrets.json
