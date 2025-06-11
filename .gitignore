@@ -1,4 +1,9 @@
-# development
+# sangoi
+/txt
+/tools
+
+/venv
+/.vscode
 .idea
 *.bak
 *.pyc
@@ -12,7 +17,9 @@ debug*.py
 /workspace*
 /models*
 /training_concepts
+/training_presets
 /training_samples
+/training_deltas
 /training_user_settings
 /external
 /update.var
