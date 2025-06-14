@@ -19,7 +19,13 @@ class NamedParameterGroup:
         self.display_name = display_name if display_name is not None else unique_name
         self.parameters = list(parameters)
         self.learning_rate = learning_rate
-
+        self.is_enabled: bool = True 
+        
+    def set_requires_grad(self, flag: bool):
+      """Liga/desliga o gradiente de todas as params do grupo."""
+      self.is_enabled = flag
+      for p in self.parameters:
+          p.requires_grad = flag
 
 class NamedParameterGroupCollection:
     __groups: list[NamedParameterGroup]
@@ -56,9 +62,16 @@ class NamedParameterGroupCollection:
                 'params': list(group.parameters),
                 'lr': lr,
                 'initial_lr': lr,
+                'name': group.unique_name,
             })
 
         return parameters
+    
+    def by_unique_name(self, name: str) -> NamedParameterGroup | None:
+        for g in self.__groups:
+            if g.unique_name == name:
+                return g
+        return None
 
     @cached_property
     def unique_name_mapping(self) -> list[str]:

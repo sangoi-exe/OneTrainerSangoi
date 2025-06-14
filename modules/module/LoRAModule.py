@@ -1,7 +1,10 @@
 import copy
+import fnmatch
 import math
 from abc import abstractmethod
 from collections.abc import Mapping
+import os
+import time
 from typing import Any
 
 from modules.util.config.TrainConfig import TrainConfig
@@ -410,8 +413,8 @@ class LoRAModuleWrapper:
     orig_module: nn.Module
     rank: int
     alpha: float
-
     lora_modules: dict[str, PeftBase]
+    _log_reset_done: bool = False
 
     def __init__(
             self,
@@ -420,12 +423,16 @@ class LoRAModuleWrapper:
             config: TrainConfig,
             module_filter: list[str] = None,
     ):
+        self.config = config
         self.orig_module = orig_module
         self.prefix = prefix
         self.peft_type = config.peft_type
         self.rank = config.lora_rank
         self.alpha = config.lora_alpha
         self.module_filter = [x.strip() for x in module_filter] if module_filter is not None else []
+        self.overrides = config.lora_overrides()
+        
+
         weight_decompose = config.lora_decompose
         if self.peft_type == PeftType.LORA:
             if weight_decompose:
@@ -449,15 +456,67 @@ class LoRAModuleWrapper:
 
         self.lora_modules = self.__create_modules(orig_module)
 
+    @staticmethod
+    def _match(pattern: str, module_name: str) -> bool:
+        if any(ch in pattern for ch in "*?"):         # glob
+            return fnmatch.fnmatch(module_name, pattern)
+        return pattern in module_name                 # substring
+
+    @classmethod
+    def _reset_log_file(cls, file_path: str):
+        """Trunca o arquivo na primeira chamada da run."""
+        if cls._log_reset_done:
+            return
+        with open(file_path, "w", encoding="utf-8") as f:
+            # opcional: header com timestamp
+            f.write(f"# LoRA modules – reset em {time.strftime('%Y-%m-%d %H:%M:%S')}{os.linesep}")
+        cls._log_reset_done = True
+
+    @staticmethod
+    def _log_created_modules(module_names: list[str], file_path: str = "lora_created_modules.txt") -> None:
+        """
+        Grava em um TXT os nomes dos módulos LoRA gerados.
+
+        Args:
+            module_names: lista de caminhos (str) retornados por named_modules().
+            file_path: caminho do arquivo onde será salvo (append).
+        """
+        # Garante que possíveis writes concorrentes não se atropelam — modo append + flush.
+        LoRAModuleWrapper._reset_log_file(file_path)
+
+        # append normal a partir daqui
+        with open(file_path, "a", encoding="utf-8") as f:
+            for name in module_names:
+                f.write(name + os.linesep)
+            f.flush()
+
     def __create_modules(self, orig_module: nn.Module | None) -> dict[str, PeftBase]:
         lora_modules = {}
+        created_names = []
+        if orig_module is None:
+            return lora_modules
 
-        if orig_module is not None:
-            for name, child_module in orig_module.named_modules():
-                if len(self.module_filter) == 0 or any(x in name for x in self.module_filter):
-                    if isinstance(child_module, Linear | Conv2d):
-                        lora_modules[name] = self.klass(self.prefix + "_" + name, child_module, *self.additional_args, **self.additional_kwargs)
-
+        for name, child in orig_module.named_modules():
+            if self.module_filter and not any(f in name for f in self.module_filter):
+                continue
+            if isinstance(child, (Linear, Conv2d)):
+                rank, alpha = self.rank, self.alpha
+                for pat, r, a in self.overrides:
+                    if self._match(pat, name):
+                        rank, alpha = r, a
+                        break  # primeira regra que casa vence
+                lora_modules[name] = self.klass(
+                    f"{self.prefix}_{name}",
+                    child,
+                    rank,
+                    alpha,
+                    **self.additional_kwargs
+                )
+                created_names.append(name)
+                
+        if created_names:
+            print("Logging LoRA modules..")
+            self._log_created_modules(created_names)
         return lora_modules
 
     def requires_grad_(self, requires_grad: bool):

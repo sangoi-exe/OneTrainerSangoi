@@ -29,6 +29,7 @@ from modules.util.ModelNames import EmbeddingName, ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.torch_util import default_device
 
+from modules.sangoi.DyLoCoConfig import DyLoCoConfig
 
 class TrainOptimizerConfig(BaseConfig):
     optimizer: Optimizer
@@ -242,6 +243,18 @@ class TrainConfig(BaseConfig):
     validate_after_unit: TimeUnit
     continue_last_backup: bool
     include_train_config: ConfigPart
+
+    # sangoi settings
+    loss_tracker_window: int
+    loss_tracker_use_mad: bool
+    # dynamic loss strenght
+    dls_use_ema: bool
+    dls_ema_decay: float
+    dls_outlier_threshold: float
+    dyloco_params: list[DyLoCoConfig]
+    lora_generate_keys_file: bool
+    use_lora_extended_features: bool
+    lora_module_overrides: str
 
     # model settings
     base_model_name: str
@@ -679,6 +692,31 @@ class TrainConfig(BaseConfig):
         config.samples = None
         return config
 
+    def lora_overrides(self) -> list[tuple[str, int, float]]:
+        """
+        Retorna lista de tuplas (pattern, rank, alpha).
+        Sintaxe por item:  pattern:rank[:alpha]
+        - pattern com '*' ou '?' vira glob.
+        - Senão, é substring simples.
+        - alpha opcional => usa self.lora_alpha.
+        """
+        out = []
+        s = (self.lora_module_overrides or "").strip()
+        if not s:
+            return out
+        for spec in s.split(";"):
+            if not spec:
+                continue
+            parts = spec.split(":")
+            if len(parts) < 2:
+                raise ValueError(f"Override inválido: '{spec}'")
+            pattern   = parts[0]
+            rank      = int(parts[1])
+            alpha     = float(parts[2]) if len(parts) > 2 else self.lora_alpha
+            out.append((pattern, rank, alpha))
+        return out
+    
+
     @staticmethod
     def default_values() -> 'TrainConfig':
         data = []
@@ -700,6 +738,17 @@ class TrainConfig(BaseConfig):
         data.append(("validate_after_unit", TimeUnit.EPOCH, TimeUnit, False))
         data.append(("continue_last_backup", False, bool, False))
         data.append(("include_train_config", ConfigPart.NONE, ConfigPart, False))
+        
+        # sangoi settings
+        data.append(("loss_tracker_window", 100, int, False))
+        data.append(("loss_tracker_use_mad", False, bool, False))
+        data.append(("dls_use_ema", False, bool, False))
+        data.append(("dls_ema_decay", 0.9, float, False))
+        data.append(("dls_outlier_threshold", 3.0, float, False))
+        data.append(("dyloco_params", [], list[DyLoCoConfig], True))
+        data.append(("use_lora_extended_features", False, bool, False))
+        data.append(("lora_generate_keys_file", False, bool, False))
+        data.append(("lora_module_overrides", "", str, False))
 
         # model settings
         data.append(("base_model_name", "stable-diffusion-v1-5/stable-diffusion-v1-5", str, False))

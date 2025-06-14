@@ -35,6 +35,8 @@ import torch
 
 import customtkinter as ctk
 
+from modules.sangoi.SangoiTab import SangoiTab
+
 
 class TrainUI(ctk.CTk):
     set_step_progress: Callable[[int, int], None]
@@ -79,6 +81,8 @@ class TrainUI(ctk.CTk):
         self.training_thread = None
         self.training_callbacks = None
         self.training_commands = None
+        
+        self.sangoi_tab_content = None
 
         # Persistent profiling window.
         self.profiling_window = ProfilingWindow(self)
@@ -140,6 +144,7 @@ class TrainUI(ctk.CTk):
         self.backup_tab = self.create_backup_tab(self.tabview.add("backup"))
         self.tools_tab = self.create_tools_tab(self.tabview.add("tools"))
         self.additional_embeddings_tab = self.create_additional_embeddings_tab(self.tabview.add("additional embeddings"))
+        self.sangoi_tab_content = self.create_sangoi_tab(self.tabview.add("sangoi"))
 
         self.change_training_method(self.train_config.training_method)
 
@@ -347,6 +352,83 @@ class TrainUI(ctk.CTk):
 
         frame.pack(fill="both", expand=1)
         return frame
+
+    def create_sangoi_tab(self, master):
+        # O frame principal agora é o 'master' que você recebeu
+        frame = ctk.CTkScrollableFrame(master, fg_color="transparent")
+        frame.pack(fill="both", expand=1) # Empacote o frame para preencher a tab
+        
+        frame.grid_columnconfigure(0, weight=0) 
+        frame.grid_columnconfigure(1, weight=1) 
+        frame.grid_columnconfigure(2, weight=0) 
+        frame.grid_columnconfigure(3, weight=1) 
+        frame.grid_columnconfigure(4, weight=0) 
+        frame.grid_columnconfigure(5, weight=1)
+
+        row_index = 0
+
+        # CORREÇÃO AQUI: Use 'frame' (que é o seu scrollable frame) em vez de 'self.main_frame'
+        # Slot 1
+        # components.label(frame, row_index, 0, "Generate Lora Layers List",
+        #                  tooltip="Generate a txt with lora layers that is going to be trained")
+        # components.switch(frame, row_index, 1, self.ui_state, "gen_lora_keys")
+        
+        # components.label(frame, row_index, 2, "Data Recorder",
+        #                  tooltip="Gravar estatísticas do treino")
+        # components.switch(frame, row_index, 3, self.ui_state, "data_recorder")
+        
+        # components.label(frame, row_index, 4, "Sangoi Debug",
+        #                  tooltip="Debug pros meus badalhos")
+        # components.switch(frame, row_index, 5, self.ui_state, "debugoi")
+        # row_index += 1
+
+        # # Slot 1
+        # components.label(frame, row_index, 0, "Use Delta Pattern",
+        #                  tooltip="Apply a pre-defined delta pattern during training.")
+        # components.switch(frame, row_index, 1, self.ui_state, "train_gps_use_it")
+
+        # # Slot 2
+        # components.label(frame, row_index, 2, "Save Delta Pattern",
+        #                  tooltip="Save the calculated delta pattern after training.")
+        # components.switch(frame, row_index, 3, self.ui_state, "train_gps_save_it")
+        # # Slot 3 (cols 4, 5) fica em branco
+        # row_index += 1
+
+        # # --- Row 3: Delta Pattern Weight & Delta Pattern Path ---
+        # # Slot 1
+        # components.label(frame, row_index, 0, "Delta Pattern Weight",
+        #                  tooltip="Weight multiplier for the delta pattern application.")
+        # components.entry(frame, row_index, 1, self.ui_state, "train_gps_weight")
+
+        # # Slot 2 (para Delta Pattern Path, o entry e seu botão ocuparão cols 3 e 4)
+        # components.label(frame, row_index, 2, "Delta Pattern Path",
+        #                  tooltip="Path to the delta pattern file (.pt, .safetensors). Leave empty if not using.")
+        # # components.file_entry coloca seu CTkEntry em (row, col=3) e o botão em (row, col=3+1=4)
+        # components.file_entry(frame, row_index, 3, self.ui_state, "train_gps_path")
+        # # Slot 3 (col 5) fica em branco
+        # row_index += 1
+
+        # # --- Row 4: Layer Blacklist ---
+        # components.label(frame, row_index, 0, "Layer Blacklist",
+        #                  tooltip="Comma-separated list of layers to exclude from training (blacklist).")
+        # blacklist_entry = components.entry(
+        #     frame, row_index, 1, self.ui_state, "lora_layers_blacklist",
+        #     tooltip="Comma-separated list of layers to exclude from training. Example: 'down_blocks.0,mid_block'"
+        # )
+        # # Entry ocupa as colunas 1, 2, 3, 4, 5
+        # blacklist_entry.grid(row=row_index, column=1, columnspan=5, sticky="ew") 
+        # row_index += 1
+
+        # # --- Row 5: Grad Ckpt Layers ---
+        # components.label(frame, row_index, 0, "Grad Ckpt Layers",
+        #                  tooltip="Comma-separated list of layer patterns to apply gradient checkpointing to. Leave empty for default behavior (usually ON for specific blocks).")
+        # gradient_ckpt_entry = components.entry(
+        #     frame, row_index, 1, self.ui_state, "gradient_checkpointing_layers",
+        #     tooltip="Define specific layers for gradient checkpointing. Example: 'mid_block,up_blocks.1'"
+        # )
+        # # Entry ocupa as colunas 1, 2, 3, 4, 5
+        # gradient_ckpt_entry.grid(row=row_index, column=1, columnspan=5, sticky="ew")
+        # row_index += 1
 
     def lora_tab(self, master):
         frame = ctk.CTkScrollableFrame(master, fg_color="transparent")

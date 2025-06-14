@@ -31,6 +31,22 @@ class StableDiffusionXLLoRASetup(
             debug_mode=debug_mode,
         )
 
+    @staticmethod
+    def _add_lora_param_groups(wrapper: LoRAModuleWrapper, prefix: str, collection: NamedParameterGroupCollection, base_lr: float):
+        """
+        Cria um NamedParameterGroup **por** sub-módulo LoRA dentro do wrapper.
+
+        prefix: identifica qual parte do modelo (unet, te1, te2…).
+        """
+        for name, lora_mod in wrapper.lora_modules.items():
+            unique = f"{prefix}.{name}"           # ex.: unet.down_blocks.1.attentions.0.proj_in
+            collection.add_group(NamedParameterGroup(
+                unique_name=unique,
+                display_name=unique,              # o Prodigy pega em 'name'
+                parameters=lora_mod.parameters(),
+                learning_rate=base_lr,
+            ))
+
     def create_parameters(
             self,
             model: StableDiffusionXLModel,
@@ -38,19 +54,47 @@ class StableDiffusionXLLoRASetup(
     ) -> NamedParameterGroupCollection:
         parameter_group_collection = NamedParameterGroupCollection()
 
-        if config.text_encoder.train:
-            parameter_group_collection.add_group(NamedParameterGroup(
-                unique_name="text_encoder_1_lora",
-                parameters=model.text_encoder_1_lora.parameters(),
-                learning_rate=config.text_encoder.learning_rate,
-            ))
+        # if config.text_encoder.train:
+        #     parameter_group_collection.add_group(NamedParameterGroup(
+        #         unique_name="text_encoder_1_lora",
+        #         parameters=model.text_encoder_1_lora.parameters(),
+        #         learning_rate=config.text_encoder.learning_rate,
+        #     ))
+            
+        # if config.text_encoder_2.train:
+        #     parameter_group_collection.add_group(NamedParameterGroup(
+        #         unique_name="text_encoder_2_lora",
+        #         parameters=model.text_encoder_2_lora.parameters(),
+        #         learning_rate=config.text_encoder_2.learning_rate,
+        #     ))
 
+        # if config.unet.train:
+        #     parameter_group_collection.add_group(NamedParameterGroup(
+        #         unique_name="unet_lora",
+        #         parameters=model.unet_lora.parameters(),
+        #         learning_rate=config.unet.learning_rate,
+        #     ))
+            
+        if config.text_encoder.train:
+            self._add_lora_param_groups(
+                model.text_encoder_1_lora,
+                "text_encoder_1_lora", parameter_group_collection,
+                config.text_encoder.learning_rate
+            )
+            
         if config.text_encoder_2.train:
-            parameter_group_collection.add_group(NamedParameterGroup(
-                unique_name="text_encoder_2_lora",
-                parameters=model.text_encoder_2_lora.parameters(),
-                learning_rate=config.text_encoder_2.learning_rate,
-            ))
+            self._add_lora_param_groups(
+                model.text_encoder_2_lora,
+                "text_encoder_2_lora", parameter_group_collection,
+                config.text_encoder_2.learning_rate
+            )
+
+        if config.unet.train:
+            self._add_lora_param_groups(
+                model.unet_lora,
+                "unet_lora", parameter_group_collection,
+                config.unet.learning_rate
+            )
 
         if config.train_any_embedding():
             if config.text_encoder.train_embedding:
@@ -65,12 +109,6 @@ class StableDiffusionXLLoRASetup(
                     "embeddings_2"
                 )
 
-        if config.unet.train:
-            parameter_group_collection.add_group(NamedParameterGroup(
-                unique_name="unet_lora",
-                parameters=model.unet_lora.parameters(),
-                learning_rate=config.unet.learning_rate,
-            ))
 
         return parameter_group_collection
 

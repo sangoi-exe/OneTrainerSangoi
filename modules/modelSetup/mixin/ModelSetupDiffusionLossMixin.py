@@ -14,7 +14,7 @@ from modules.util.loss.vb_loss import vb_losses
 from torch.utils.tensorboard import SummaryWriter
 
 from torch import Tensor
-from modules.util.loss.dynamic_loss_strength import LossTracker, DynamicLossStrength
+from modules.sangoi.DynamicLossControl import LossTracker, DynamicLossControl
 
 import torch
 import torch.nn.functional as F
@@ -28,14 +28,30 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 	def __init__(self):
 		super().__init__()
 		self.__align_prop_loss_fn = None
-		self.__coefficients = None
 		self.__alphas_cumprod_fun = None
+		self.__coefficients = None
 		self.__sigmas = None
-		self.tensorboard = None
 		self.progress = None
 		self.config = None
-		self.loss_tracker = LossTracker(window_size=100, use_mad=False)
-		self.dynamic_loss_strengthing = DynamicLossStrength()
+		self.tensorboard = None
+		
+		loss_tracker_window = getattr(self.config, "loss_tracker_window", 100)
+		loss_tracker_use_mad = getattr(self.config, "loss_tracker_use_mad", False)
+		self.loss_tracker = LossTracker(
+			window_size=loss_tracker_window,
+			use_mad=loss_tracker_use_mad
+			)
+
+		dyloco_use_ema = getattr(self.config, "dyloco_use_ema", False)
+		dyloco_ema_decay = getattr(self.config, "dyloco_ema_decay", 0.9)
+		dyloco_outlier_threshold = getattr(self.config, "dyloco_outlier_threshold", 3.0)
+		dyloco_params = getattr(self.config, "dyloco_params", None)
+		self.dynamic_loss_strengthing = DynamicLossControl(
+			use_ema=dyloco_use_ema,
+			ema_decay=dyloco_ema_decay,
+			outlier_threshold=dyloco_outlier_threshold,
+			scheduler_params=dyloco_params
+			)
 
 	def __align_prop_losses(
 		self,
