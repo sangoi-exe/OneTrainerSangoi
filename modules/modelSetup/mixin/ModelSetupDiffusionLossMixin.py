@@ -464,14 +464,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 		tensorboard.add_scalar(
 			"sangoi/4reward", reward.mean().item(), progress.global_step
 		)
-		tensorboard.add_scalar(
-			"sangoi/alpha", alpha, progress.global_step
-		)
-		tensorboard.add_scalar(
-			"sangoi/scenario_snr_weight_mean",
-			scenario_snr_weight.mean().item(),
-			progress.global_step,
-		)
 
 		return reward
 

@@ -361,8 +361,8 @@ class ModelTab:
             allow_checkpoint: bool = False,
     ) -> int:
         # output model destination
-        components.label(self.scroll_frame, row, 0, "Model Output Destination",
-                         tooltip="Filename or directory where the output model is saved")
+        components.label(self.scroll_frame, row, 0, "Output Model Basename",
+                         tooltip="Basename to compose the output model filename saved on workspace dir.")
         components.file_entry(self.scroll_frame, row, 1, self.ui_state, "output_model_destination", is_output=True)
 
         # output data type

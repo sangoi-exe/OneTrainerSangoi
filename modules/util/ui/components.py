@@ -185,9 +185,32 @@ def icon_button(master, row, column, text, command):
     return component
 
 
-def button(master, row, column, text, command, tooltip=None):
-    component = ctk.CTkButton(master, text=text, command=command)
-    component.grid(row=row, column=column, padx=PAD, pady=PAD, sticky="new")
+def button(
+    master,
+    row: int,
+    column: int,
+    text: str,
+    command,
+    tooltip: str | None = None,
+    *,
+    padx: int | None = None,
+    pady: int | None = None,
+    **btn_kwargs,                 # permite passar outras opções do CTkButton se quiser
+):
+    """
+    Cria um CTkButton e o posiciona no grid.
+
+    - Se `padx` ou `pady` forem omitidos → usa o constante PAD atual.
+    - `btn_kwargs` é pass-through para CTkButton (width, fg_color, etc.).
+    """
+    component = ctk.CTkButton(master, text=text, command=command, **btn_kwargs)
+    component.grid(
+        row=row,
+        column=column,
+        padx=PAD if padx is None else padx,
+        pady=PAD if pady is None else pady,
+        sticky="new",
+    )
     if tooltip:
         ToolTip(component, tooltip, x_position=25)
     return component

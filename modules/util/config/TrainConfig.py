@@ -253,7 +253,6 @@ class TrainConfig(BaseConfig):
     dls_outlier_threshold: float
     dyloco_params: list[DyLoCoConfig]
     lora_generate_keys_file: bool
-    use_lora_extended_features: bool
     lora_module_overrides: str
 
     # model settings
@@ -746,7 +745,6 @@ class TrainConfig(BaseConfig):
         data.append(("dls_ema_decay", 0.9, float, False))
         data.append(("dls_outlier_threshold", 3.0, float, False))
         data.append(("dyloco_params", [], list[DyLoCoConfig], True))
-        data.append(("use_lora_extended_features", False, bool, False))
         data.append(("lora_generate_keys_file", False, bool, False))
         data.append(("lora_module_overrides", "", str, False))
 

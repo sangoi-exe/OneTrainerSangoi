@@ -47,17 +47,22 @@ class TrainUI(ctk.CTk):
     training_callbacks: TrainCallbacks | None
     training_commands: TrainCommands | None
 
+    pause_switch_var: ctk.BooleanVar | None = None
+    pause_switch_widget: ctk.CTkSwitch | None = None
+
     def __init__(self):
         super().__init__()
 
-        self.title("OneTrainer")
-        self.geometry("1100x740")
+        self.title("OneTrainer SOTA")
+        self.geometry("1280x720")
 
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
 
         self.train_config = TrainConfig.default_values()
         self.ui_state = UIState(self, self.train_config)
+
+        self.pause_switch_var = False
 
         self.grid_rowconfigure(0, weight=0)
         self.grid_rowconfigure(1, weight=1)
@@ -86,6 +91,7 @@ class TrainUI(ctk.CTk):
 
         # Persistent profiling window.
         self.profiling_window = ProfilingWindow(self)
+        
 
     def close(self):
         self.top_bar_component.save_default()
@@ -106,24 +112,112 @@ class TrainUI(ctk.CTk):
 
         self.set_step_progress, self.set_epoch_progress = components.double_progress(frame, 0, 0, "step", "epoch")
 
-        self.status_label = components.label(frame, 0, 1, "",
-                                             tooltip="Current status of the training run")
+        self.status_label = components.label(frame, 0, 1, "", tooltip="Current status of the training run")
 
-        # padding
+        # padding/spacer – coluna 2 vira mola
         frame.grid_columnconfigure(2, weight=1)
 
+        self.pause_switch_var = ctk.BooleanVar(value=False)          # nasce desligado, nunca salvo
+        self.pause_switch_widget = ctk.CTkSwitch(master=frame, text="Pause Train", variable=self.pause_switch_var, command=self.toggle_pause)
+        self.pause_switch_widget.grid(row=0, column=3, padx=50, pady=15)
+        
         # tensorboard button
-        components.button(frame, 0, 3, "Tensorboard", self.open_tensorboard)
-
+        components.button(frame, 0, 4, "Tensorboard", self.open_tensorboard, pady=15)
         # training button
-        self.training_button = components.button(frame, 0, 4, "Start Training", self.start_training)
-
+        self.training_button = components.button(frame, 0, 5, "Start Training", self.start_training, pady=15)
         # export button
-        self.export_button = components.button(frame, 0, 5, "Export", self.export_training,
-                                               tooltip="Export the current configuration as a script to run without a UI")
-
+        self.export_button = components.button(frame, 0, 6, "Export", self.export_training, tooltip="Export the current configuration as a script to run without a UI", pady=15)
 
         return frame
+
+    def _update_pause_switch_initial_state(self):
+        if not self.pause_switch_widget:
+            return
+
+        commands = self.training_commands
+        pause_pending  = commands.is_pause_pending()  if commands else False
+        resume_pending = commands.is_resume_pending() if commands else False
+
+        if pause_pending:
+            self.pause_switch_var.set(True)
+            self.pause_switch_widget.select()
+            self.pause_switch_widget.configure(state="disabled")
+            print("[UI Init] Pause pending → switch ON / DISABLED")
+        elif resume_pending:
+            self.pause_switch_var.set(False)
+            self.pause_switch_widget.deselect()
+            self.pause_switch_widget.configure(state="disabled")
+            print("[UI Init] Resume pending → switch OFF / DISABLED")
+        else:
+            self.pause_switch_var.set(False)
+            self.pause_switch_widget.deselect()
+            self.pause_switch_widget.configure(state="normal")
+            print("[UI Init] No pending requests → switch OFF / NORMAL")
+
+    def toggle_pause(self):
+        if not self.training_commands:
+            print("[UI] Cannot pause/resume: Not training.")
+            self.pause_switch_var.set(False)
+            self.pause_switch_widget.deselect()
+            return
+
+        is_checked = self.pause_switch_var.get()
+        print(f"[UI] Toggle Pause clicked. Var now: {is_checked}")
+
+        if is_checked:              # usuário quer PAUSAR
+            if self.training_commands.request_pause():
+                print("[UI] Pause request sent – disabling switch until trainer responds.")
+                self.pause_switch_widget.configure(state="disabled")   # <–– AQUI
+            else:
+                print("[UI] Request rejected, rolling back.")
+                self.pause_switch_var.set(False)
+        else:                       # usuário quer RETOMAR
+            if self.training_commands.request_resume():
+                print("[UI] Resume request sent – disabling switch until trainer responds.")
+                self.pause_switch_widget.configure(state="disabled")   # <–– AQUI
+            else:
+                print("[UI] Request rejected, rolling back.")
+                self.pause_switch_var.set(True)
+
+    def handle_pause_request_accepted_threadsafe(self):
+        print("[UI Callback Thread] Pause request accepted by trainer.")
+        self.after(0, self._handle_pause_request_accepted_ui)
+
+    def handle_pause_initiated_threadsafe(self):
+        print("[UI Callback Thread] Pause initiated by trainer (model on CPU).")
+        self.after(0, self._handle_pause_initiated_ui)
+
+    def handle_resume_started_threadsafe(self):
+        print("[UI Callback Thread] Resume started by trainer.")
+        self.after(0, self._handle_resume_started_ui)
+
+    def handle_resume_completed_threadsafe(self):
+        print("[UI Callback Thread] Resume completed by trainer.")
+        self.after(0, self._handle_resume_completed_ui)
+
+    def _handle_pause_request_accepted_ui(self):
+        print("[UI] Trainer acknowledged pause request (will stop at safe-point).")
+        if self.pause_switch_widget:
+            self.pause_switch_var.set(True)         # garante ON
+            # NÃO muda state – já está disabled desde o clique
+
+    def _handle_pause_initiated_ui(self):
+        print("[UI] Trainer paused. Switch ON, now clickable to resume.")
+        if self.pause_switch_widget:
+            self.pause_switch_var.set(True)
+            self.pause_switch_widget.configure(state="normal")
+
+    def _handle_resume_started_ui(self):
+        print("[UI] Trainer starting resume (model → GPU). Switch OFF, still disabled.")
+        if self.pause_switch_widget:
+            self.pause_switch_var.set(False)
+            # permanece disabled
+
+    def _handle_resume_completed_ui(self):
+        print("[UI] Trainer resumed. Switch OFF, NORMAL.")
+        if self.pause_switch_widget:
+            self.pause_switch_var.set(False)
+            self.pause_switch_widget.configure(state="normal")         # libera uso futuro
 
     def content_frame(self, master):
         frame = ctk.CTkFrame(master=master, corner_radius=0)
@@ -636,6 +730,12 @@ class TrainUI(ctk.CTk):
         self.training_callbacks = TrainCallbacks(
             on_update_train_progress=self.on_update_train_progress,
             on_update_status=self.on_update_status,
+
+            # callbacks de pausa
+            on_pause_request_accepted=self.handle_pause_request_accepted_threadsafe,
+            on_pause_initiated=self.handle_pause_initiated_threadsafe,
+            on_resume_started=self.handle_resume_started_threadsafe,
+            on_resume_completed=self.handle_resume_completed_threadsafe,
         )
 
         ZLUDA.initialize_devices(self.train_config)

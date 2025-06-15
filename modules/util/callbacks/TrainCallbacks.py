@@ -1,3 +1,5 @@
+# AQUI TEM LÓGICA DE PAUSE
+
 import contextlib
 from collections.abc import Callable
 
@@ -15,6 +17,11 @@ class TrainCallbacks:
             on_update_sample_default_progress: Callable[[int, int], None] = lambda _, __: None,
             on_sample_custom: Callable[[Image], None] = lambda _: None,
             on_update_sample_custom_progress: Callable[[int, int], None] = lambda _, __: None,
+
+            on_pause_request_accepted: Callable[[], None] = lambda: None,
+            on_pause_initiated: Callable[[], None] = lambda: None,
+            on_resume_started: Callable[[], None] = lambda: None,
+            on_resume_completed: Callable[[], None] = lambda: None
     ):
         self.__on_update_train_progress = on_update_train_progress
         self.__on_update_status = on_update_status
@@ -22,6 +29,35 @@ class TrainCallbacks:
         self.__on_update_sample_default_progress = on_update_sample_default_progress
         self.__on_sample_custom = on_sample_custom
         self.__on_update_sample_custom_progress = on_update_sample_custom_progress
+
+        self.__on_pause_request_accepted = on_pause_request_accepted
+        self.__on_pause_initiated = on_pause_initiated
+        self.__on_resume_started = on_resume_started
+        self.__on_resume_completed = on_resume_completed
+
+    def on_pause_request_accepted(self):
+        """Chamado quando o trainer aceita a requisição de pausa."""
+        if self.__on_pause_request_accepted:
+            with contextlib.suppress(Exception): # Segurança contra erros no callback da UI
+                self.__on_pause_request_accepted()
+
+    def on_pause_initiated(self):
+        """Chamado quando a pausa realmente começa (modelo no CPU)."""
+        if self.__on_pause_initiated:
+            with contextlib.suppress(Exception):
+                self.__on_pause_initiated()
+
+    def on_resume_started(self):
+        """Chamado quando o comando de resume é recebido."""
+        if self.__on_resume_started:
+            with contextlib.suppress(Exception):
+                self.__on_resume_started()
+
+    def on_resume_completed(self):
+        """Chamado quando o modelo está de volta na GPU."""
+        if self.__on_resume_completed:
+            with contextlib.suppress(Exception):
+                self.__on_resume_completed()         
 
     # on_update_train_progress
     def set_on_update_train_progress(
