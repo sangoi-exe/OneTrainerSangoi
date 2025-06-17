@@ -10,7 +10,7 @@ class LossTracker:
     It can use mean/std or median/MAD for statistics.
     """
 
-    def __init__(self, window_size: int = 100, use_mad: bool = False) -> None:
+    def __init__(self, window_size: int = 100, use_mad: bool = True) -> None:
         """
         Initializes the LossTracker.
 
@@ -97,7 +97,7 @@ class DynamicLossControl:
 
     def __init__(
         self,
-        use_ema: bool = False,
+        use_ema: bool = True,
         ema_decay: float = 0.9,
         outlier_threshold: float = 3.0,
         scheduler_params: list[dict[str, str]] = None,  # agora é lista de dict com key/value

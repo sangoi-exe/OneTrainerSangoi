@@ -435,6 +435,45 @@ class BaseStableDiffusionXLSetup(
                     added_cond_kwargs=added_cond_kwargs,
                 ).sample
 
+                # --- INÍCIO DA INJEÇÃO: Forward Pass Não Condicionado (VERSÃO CORRETA) ---
+                # --- INÍCIO DA INJEÇÃO: Forward Pass Não Condicionado (VERSÃO COM CORREÇÃO DE DEVICE E GRADIENTE) ---
+                noise_pred_uncond = None
+                # Vamos remover a verificação do analisador por enquanto e forçar a execução para debug
+                # if hasattr(model, 'token_analyzer') and model.token_analyzer is not None:
+                with torch.no_grad(): # Temporariamente desabilita gradientes para o encode não condicionado
+                    uncond_text_encoder_output, uncond_pooled_text_encoder_output = model.encode_text(
+                        train_device=self.train_device,
+                        batch_size=batch['latent_image'].shape[0],
+                        rand=rand,
+                        text="",
+                    )
+
+                # Movemos explicitamente para o device de treino (GPU)
+                uncond_text_encoder_output = uncond_text_encoder_output.to(self.train_device)
+                uncond_pooled_text_encoder_output = uncond_pooled_text_encoder_output.to(self.train_device)
+
+                # Expandimos para o tamanho do batch
+                uncond_text_encoder_output = uncond_text_encoder_output.expand(latent_input.shape[0], -1, -1)
+                uncond_pooled_text_encoder_output = uncond_pooled_text_encoder_output.expand(latent_input.shape[0], -1)
+
+                # HACK BRUTAL: Re-anexamos o gradiente. Isso pode funcionar.
+                uncond_text_encoder_output.requires_grad_(True)
+
+                uncond_added_cond_kwargs = {"text_embeds": uncond_pooled_text_encoder_output, "time_ids": add_time_ids}
+                
+                # Agora a UNet recebe tensores no mesmo device
+                noise_pred_uncond = model.unet(
+                    sample=latent_input.to(dtype=model.train_dtype.torch_dtype()),
+                    timestep=timestep,
+                    encoder_hidden_states=uncond_text_encoder_output.to(dtype=model.train_dtype.torch_dtype()),
+                    added_cond_kwargs=uncond_added_cond_kwargs,
+                ).sample
+                # --- FIM DA INJEÇÃO ---
+
+                # --- FIM DA INJEÇÃO ---
+
+
+
                 model_output_data = {}
 
                 if model.noise_scheduler.config.prediction_type == 'epsilon':
@@ -443,6 +482,7 @@ class BaseStableDiffusionXLSetup(
                         'timestep': timestep,
                         'predicted': predicted_latent_noise,
                         'target': latent_noise,
+                        'predicted_uncond': noise_pred_uncond,
                     }
                 elif model.noise_scheduler.config.prediction_type == 'v_prediction':
                     target_velocity = model.noise_scheduler.get_velocity(scaled_latent_image, latent_noise, timestep)
@@ -451,6 +491,7 @@ class BaseStableDiffusionXLSetup(
                         'timestep': timestep,
                         'predicted': predicted_latent_noise,
                         'target': target_velocity,
+                        'predicted_uncond': noise_pred_uncond,
                     }
 
             if config.debug_mode:
@@ -548,7 +589,7 @@ class BaseStableDiffusionXLSetup(
             progress: TrainProgress,
             tensorboard: SummaryWriter
     ) -> Tensor:
-        return self._diffusion_losses(
+        losses, loss_uncond = self._diffusion_losses(
             batch=batch,
             data=data,
             config=config,
@@ -556,4 +597,7 @@ class BaseStableDiffusionXLSetup(
             tensorboard=tensorboard,
             train_device=self.train_device,
             betas=model.noise_scheduler.betas.to(device=self.train_device),
-        ).mean()
+        )
+
+        # Retornamos a perda principal para o otimizador, e a de diagnóstico para nosso hack.
+        return losses.mean(), loss_uncond

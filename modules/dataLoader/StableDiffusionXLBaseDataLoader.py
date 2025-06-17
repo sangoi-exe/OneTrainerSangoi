@@ -263,7 +263,7 @@ class StableDiffusionXLBaseDataLoader(
         enumerate_input = self._enumerate_input_modules(config)
         load_input = self._load_input_modules(config, model.vae_train_dtype, model.add_embeddings_to_prompt)
         mask_augmentation = self._mask_augmentation_modules(config)
-        aspect_bucketing_in = self._aspect_bucketing_in(config, 64)
+        aspect_bucketing_in = self._aspect_bucketing_in(config, config.bucket_ratio)
         crop_modules = self._crop_modules(config)
         augmentation_modules = self._augmentation_modules(config)
         inpainting_modules = self._inpainting_modules(config)

@@ -245,6 +245,15 @@ class TrainConfig(BaseConfig):
     include_train_config: ConfigPart
 
     # sangoi settings
+    lora_generate_keys_file: bool
+    lora_module_overrides: str
+    bucket_ratio: int
+    huber_strength: float
+    charbonier_strength: float
+    parameters_by_module: bool
+    param_group_strategy: str # module | block | stage | type | stage_type | block_type
+    enable_token_grad_analyzer: bool
+
     loss_tracker_window: int
     loss_tracker_use_mad: bool
     # dynamic loss strenght
@@ -252,8 +261,6 @@ class TrainConfig(BaseConfig):
     dls_ema_decay: float
     dls_outlier_threshold: float
     dyloco_params: list[DyLoCoConfig]
-    lora_generate_keys_file: bool
-    lora_module_overrides: str
 
     # model settings
     base_model_name: str
@@ -739,14 +746,20 @@ class TrainConfig(BaseConfig):
         data.append(("include_train_config", ConfigPart.NONE, ConfigPart, False))
         
         # sangoi settings
+        data.append(("parameters_by_module", False, bool, False))
+        data.append(("enable_token_grad_analyzer", False, bool, False))
+        data.append(("param_group_strategy", "module", str, False))
         data.append(("loss_tracker_window", 100, int, False))
         data.append(("loss_tracker_use_mad", False, bool, False))
         data.append(("dls_use_ema", False, bool, False))
         data.append(("dls_ema_decay", 0.9, float, False))
         data.append(("dls_outlier_threshold", 3.0, float, False))
+        data.append(("huber_strength", 0.0, float, False))
+        data.append(("charbonier_strength", 0.0, float, False))
         data.append(("dyloco_params", [], list[DyLoCoConfig], True))
         data.append(("lora_generate_keys_file", False, bool, False))
         data.append(("lora_module_overrides", "", str, False))
+        data.append(("bucket_ratio", 64, int, False))
 
         # model settings
         data.append(("base_model_name", "stable-diffusion-v1-5/stable-diffusion-v1-5", str, False))
@@ -798,7 +811,6 @@ class TrainConfig(BaseConfig):
         data.append(("align_prop_truncate_steps", 0.5, float, False))
         data.append(("align_prop_cfg_scale", 7.0, float, False))
         data.append(("loss_mode_fn", LossMode.ORIGINAL, LossMode, False))
-        data.append(("mse_strength", 1.0, float, False))
         data.append(("mse_strength", 1.0, float, False))
         data.append(("mae_strength", 0.0, float, False))
         data.append(("log_cosh_strength", 0.0, float, False))
