@@ -31,27 +31,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     self.__alphas_cumprod_fun = None
     self.__coefficients = None
     self.__sigmas = None
+    self.tensorboard = None
     self.progress = None
     self.config = None
-    self.tensorboard = None
-    
-    loss_tracker_window = getattr(self.config, "loss_tracker_window", 100)
-    loss_tracker_use_mad = getattr(self.config, "loss_tracker_use_mad", False)
-    self.loss_tracker = LossTracker(
-      window_size=loss_tracker_window,
-      use_mad=loss_tracker_use_mad
-      )
-
-    dyloco_use_ema = getattr(self.config, "dyloco_use_ema", False)
-    dyloco_ema_decay = getattr(self.config, "dyloco_ema_decay", 0.9)
-    dyloco_outlier_threshold = getattr(self.config, "dyloco_outlier_threshold", 3.0)
-    dyloco_params = getattr(self.config, "dyloco_params", None)
-    self.dynamic_loss_strengthing = DynamicLossControl(
-      use_ema=dyloco_use_ema,
-      ema_decay=dyloco_ema_decay,
-      outlier_threshold=dyloco_outlier_threshold,
-      scheduler_params=dyloco_params
-      )
+    self.loss_tracker = LossTracker()
+    self.dynamic_loss_strengthing = DynamicLossControl()
 
   def __align_prop_losses(
     self,
@@ -473,6 +457,14 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     )
     tensorboard.add_scalar(
       "sangoi/4reward", reward.mean().item(), progress.global_step
+    )
+    tensorboard.add_scalar(
+      "sangoi/alpha", alpha, progress.global_step
+    )
+    tensorboard.add_scalar(
+      "sangoi/scenario_snr_weight_mean",
+      scenario_snr_weight.mean().item(),
+      progress.global_step,
     )
 
     return reward

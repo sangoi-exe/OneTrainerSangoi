@@ -18,6 +18,8 @@ class LossTracker:
             window_size (int): The number of recent loss values to track.
             use_mad (bool): If True, use median and MAD instead of mean and std.
         """
+
+
         self.window_size: int = window_size
         self.use_mad: bool = use_mad
 
@@ -98,55 +100,59 @@ class DynamicLossControl:
     def __init__(
         self,
         use_ema: bool = True,
-        ema_decay: float = 0.9,
+        ema_decay: float = 0.7,
         outlier_threshold: float = 3.0,
-        scheduler_params: list[dict[str, str]] = None,  # agora é lista de dict com key/value
+        schedule_params: Dict[str, Dict[str, float]] = None,
     ) -> None:
-        self.use_ema = use_ema
-        self.ema_decay = ema_decay
-        self.outlier_threshold = outlier_threshold
+        """
+        Initializes the DynamicLossControl.
 
-        # Constrói o dicionário interno de schedule a partir da lista
-        self.schedule_params = self._initialize_schedule_params(scheduler_params)
+        Args:
+            use_ema (bool): Whether to use Exponential Moving Average for weights.
+            ema_decay (float): Decay rate for EMA.
+            outlier_threshold (float): Threshold to clamp z-scores.
+            schedule_params (Dict[str, Dict[str, float]]): Scheduling parameters for each loss.
+                Expected format:
+                {
+                    'mae': {'start': float, 'end': float},
+                    'mse': {'start': float, 'end': float},
+                    'log_cosh': {'start': float, 'end': float}
+                }
+                If None, default values will be used.
+        """
+        self.use_ema: bool = use_ema
+        self.ema_decay: float = ema_decay
+        self.outlier_threshold: float = outlier_threshold
 
-        # Estado da EMA
-        self.ema_weights = {"mse": 1.0, "mae": 1.0, "log_cosh": 1.0}
-        self.initialized = False
+        # Initialize scheduling parameters
+        self.schedule_params: Dict[str, Dict[str, float]] = self._initialize_schedule_params(schedule_params)
 
-    def _initialize_schedule_params(
-        self,
-        scheduler_params: list[dict[str, str]] = None
-    ) -> dict[str, dict[str, float]]:
-        # parâmetros default
-        default = {
+        # EMA state
+        self.ema_weights: Dict[str, float] = {"mse": 1.0, "mae": 1.0, "log_cosh": 1.0}
+        self.initialized: bool = False
+
+    def _initialize_schedule_params(self, schedule_params: Dict[str, Dict[str, float]] = None) -> Dict[str, Dict[str, float]]:
+        """
+        Initializes the scheduling parameters.
+
+        Args:
+            schedule_params (Dict[str, Dict[str, float]], optional):
+                User-provided scheduling parameters.
+
+        Returns:
+            Dict[str, Dict[str, float]]: Initialized scheduling parameters.
+        """
+        default_params = {
             "mae": {"start": 0.6, "end": 0.0},
             "mse": {"start": 0.2, "end": 0.6},
             "log_cosh": {"start": 0.2, "end": 0.4},
         }
-
-        if not scheduler_params:
-            return default
-
-        for entry in scheduler_params:
-            full_key = entry.get("key", "")
-            val_str = entry.get("value", "")
-            try:
-                val = float(val_str)
-            except ValueError:
-                raise ValueError(f"Valor inválido em scheduler_params: '{val_str}' não é float")
-
-            # espera formato "loss_type.param", ex: "mae.start"
-            parts = full_key.split(".")
-            if len(parts) != 2:
-                raise KeyError(f"Chave inválida em scheduler_params: '{full_key}'")
-
-            loss, param = parts
-            if loss not in default or param not in ("start", "end"):
-                raise KeyError(f"Parâmetro desconhecido: '{full_key}'")
-
-            default[loss][param] = val
-
-        return default
+        if schedule_params is not None:
+            # Merge user-provided parameters with defaults
+            for loss_type, params in default_params.items():
+                if loss_type in schedule_params:
+                    default_params[loss_type].update(schedule_params[loss_type])
+        return default_params
 
     def adjust_weights(
         self,
