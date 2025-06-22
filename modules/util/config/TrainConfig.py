@@ -251,8 +251,9 @@ class TrainConfig(BaseConfig):
     huber_strength: float
     charbonier_strength: float
     parameters_by_module: bool
-    param_group_strategy: str # module | block | stage | type | stage_type | block_type
     enable_token_grad_analyzer: bool
+    param_group_strategy: str # module | block | stage | type | stage_type | block_type
+    dora_paper_calc: bool
 
     loss_tracker_window: int
     loss_tracker_use_mad: bool
@@ -760,6 +761,7 @@ class TrainConfig(BaseConfig):
         data.append(("lora_generate_keys_file", False, bool, False))
         data.append(("lora_module_overrides", "", str, False))
         data.append(("bucket_ratio", 64, int, False))
+        data.append(("dora_paper_calc", False, bool, False))
 
         # model settings
         data.append(("base_model_name", "stable-diffusion-v1-5/stable-diffusion-v1-5", str, False))

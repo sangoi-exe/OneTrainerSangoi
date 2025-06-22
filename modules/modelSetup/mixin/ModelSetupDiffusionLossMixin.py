@@ -72,24 +72,24 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
     return losses * config.align_prop_weight
 
-  # def __log_cosh_loss(
-  #     self,
-  #     pred: torch.Tensor,
-  #     target: torch.Tensor,
-  # ):
-  #   diff = pred - target
-  #   loss = diff + torch.nn.functional.softplus(-2.0*diff) - torch.log(torch.full(size=diff.size(), fill_value=2.0, dtype=torch.float32, device=diff.device))
-  #   return loss
-  def __log_cosh_loss( # gambiarra pra testar charbonier
+  def __log_cosh_loss(
       self,
       pred: torch.Tensor,
       target: torch.Tensor,
-      eps: float = 1e-3,
-      alpha: float = 0.5,  # 0.5 = raiz -> Charbonnier clássico
-  ) -> torch.Tensor:
-      diff = pred - target
-      # (diff² + eps²)^(alpha)
-      return torch.pow(diff.square().add_(eps * eps), alpha)	
+  ):
+    diff = pred - target
+    loss = diff + torch.nn.functional.softplus(-2.0*diff) - torch.log(torch.full(size=diff.size(), fill_value=2.0, dtype=torch.float32, device=diff.device))
+    return loss
+  # def __log_cosh_loss( # gambiarra pra testar charbonier
+  #     self,
+  #     pred: torch.Tensor,
+  #     target: torch.Tensor,
+  #     eps: float = 1e-3,
+  #     alpha: float = 0.5,  # 0.5 = raiz -> Charbonnier clássico
+  # ) -> torch.Tensor:
+  #     diff = pred - target
+  #     # (diff² + eps²)^(alpha)
+  #     return torch.pow(diff.square().add_(eps * eps), alpha)	
 
   def __masked_losses(
       self,
@@ -515,19 +515,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
       else:
         losses = self.__unmasked_losses(batch, data, config)
 
-    loss_uncond = None
-    # Se a previsão não condicionada foi calculada e está no dicionário de dados
-    if 'predicted_uncond' in data and data['predicted_uncond'] is not None:
-        with torch.no_grad():
-            # Calculamos a perda não condicionada.
-            # Ela NÃO é adicionada à perda principal que será usada para o backprop.
-            loss_uncond = F.mse_loss(
-                data['predicted_uncond'].to(dtype=torch.float32),
-                data['target'].to(dtype=torch.float32),
-                reduction="mean"
-            )
-    # --- FIM DA INJEÇÃO ---
-
     # Scale Losses by Batch and/or GA (if enabled)
     losses = losses * batch_size_scale * gradient_accumulation_steps_scale
 
@@ -575,7 +562,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             self.progress.global_step,
           )
 
-    return losses, loss_uncond
+    return losses
 
   def _flow_matching_losses(
     self,

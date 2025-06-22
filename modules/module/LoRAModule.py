@@ -333,7 +333,6 @@ class LoRAModule(PeftBase):
         # TODO
         pass
 
-
 class DoRAModule(LoRAModule):
     """Weight-decomposed low rank adaptation.
 
@@ -343,10 +342,12 @@ class DoRAModule(LoRAModule):
     dora_num_dims: int
     dora_scale: Tensor | None
     norm_epsilon: bool
+    dora_paper_calc: bool
 
     def __init__(self, *args, **kwargs):
         self.dora_scale = None
         self.norm_epsilon = kwargs.pop('norm_epsilon', False)
+        self.dora_paper_calc = kwargs.pop('dora_paper_calc', False)
         self.train_device = kwargs.pop('train_device')
         super().__init__(*args, **kwargs)
 
@@ -359,14 +360,23 @@ class DoRAModule(LoRAModule):
         # wrangling that works for both Linear and Convolutional layers. If you
         # were just doing this for Linear, it would be substantially simpler.
         self.dora_num_dims = orig_weight.dim() - 1
-        self.dora_scale = nn.Parameter(
-            torch.norm(
-                orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1),
-                dim=1, keepdim=True)
-            .reshape(orig_weight.shape[1], *[1] * self.dora_num_dims)
-            .transpose(1, 0)
-            .to(device=self.orig_module.weight.device)
-        )
+        if self.dora_paper_calc:
+            self.dora_scale = nn.Parameter(
+                torch.norm(
+                    orig_weight.reshape(orig_weight.shape[0], -1),
+                    dim=1, keepdim=True)
+                .reshape(orig_weight.shape[0], *[1] * self.dora_num_dims)
+                .to(device=self.orig_module.weight.device)
+            )
+        else:
+            self.dora_scale = nn.Parameter(
+                torch.norm(
+                    orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1),
+                    dim=1, keepdim=True)
+                .reshape(orig_weight.shape[1], *[1] * self.dora_num_dims)
+                .transpose(1, 0)
+                .to(device=self.orig_module.weight.device)
+            )
 
         del orig_weight
 
@@ -388,12 +398,19 @@ class DoRAModule(LoRAModule):
         # backpropagation in order to save VRAM (to do this, we detach it from
         # the gradient graph).
         eps = torch.finfo(WP.dtype).eps if self.norm_epsilon else 0.0
-        norm = WP.detach() \
-                 .transpose(0, 1) \
-                 .reshape(WP.shape[1], -1) \
-                 .norm(dim=1, keepdim=True) \
-                 .reshape(WP.shape[1], *[1] * self.dora_num_dims) \
-                 .transpose(0, 1) + eps
+        if self.dora_paper_calc:
+            norm = WP.detach() \
+                    .reshape(WP.shape[0], -1) \
+                    .norm(dim=1) \
+                    .reshape(WP.shape[0], *[1] * self.dora_num_dims) \
+                    + eps
+        else:
+            norm = WP.detach() \
+                    .transpose(0, 1) \
+                    .reshape(WP.shape[1], -1) \
+                    .norm(dim=1, keepdim=True) \
+                    .reshape(WP.shape[1], *[1] * self.dora_num_dims) \
+                    .transpose(0, 1) + eps
         WP = self.dora_scale * (WP / norm)
         # In the DoRA codebase (and thus the paper results), they perform
         # dropout on the *input*, rather than between layers, so we duplicate
@@ -403,11 +420,9 @@ class DoRAModule(LoRAModule):
                        self.orig_module.bias,
                        **self.layer_kwargs)
 
-
 DummyLoRAModule = LoRAModule.make_dummy()
 DummyDoRAModule = DoRAModule.make_dummy()
 DummyLoHaModule = LoHaModule.make_dummy()
-
 
 class LoRAModuleWrapper:
     orig_module: nn.Module

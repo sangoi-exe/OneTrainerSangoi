@@ -42,9 +42,6 @@ from torchvision.transforms.functional import pil_to_tensor
 from PIL.Image import Image
 from tqdm import tqdm
 
-from modules.sangoi.TokenGradientAnalyzer import TokenGradientAnalyzer
-
-
 class GenericTrainer(BaseTrainer):
     model_loader: BaseModelLoader
     model_setup: BaseModelSetup
@@ -102,7 +99,6 @@ class GenericTrainer(BaseTrainer):
         self.pause_requested_at_epoch_end = False
 
         self._steps_per_epoch = None
-        self.token_analyzer = None
 
     def _handle_pause_logic(self):
         """Executa a lógica de pausa, movendo o modelo e esperando."""
@@ -168,6 +164,31 @@ class GenericTrainer(BaseTrainer):
 
             self.commands.stop()
             self.callbacks.on_update_status(f"Error during pause/resume: {e}")
+    
+    @staticmethod
+    def stop_grad_outside_mask(tensor: torch.Tensor, mask_bf16: torch.Tensor) -> None:
+        """
+        Mantém o forward intacto (contexto total) e zera gradiente fora da máscara.
+        * `tensor`: saída bruta do modelo (bf16/fp16/fp32).
+        * `mask`  : mesma shape espacial, dtype float/bool (1 = região de interesse).
+        """
+        def _hook(grad: torch.Tensor) -> torch.Tensor:
+            return grad * mask_bf16       # mesmo dtype → sem crash
+        tensor.register_hook(_hook)
+
+    @staticmethod
+    def prepare_mask(
+        mask: torch.Tensor,
+        ref: torch.Tensor,
+        thresh: float = 0.5
+        ) -> torch.Tensor:
+        """Binariza + broadcasta máscara para ter shape/dtype de `ref`."""
+        m = (mask > thresh).to(dtype=ref.dtype, device=ref.device)
+        if m.ndim < ref.ndim:            # [B,H,W] → [B,1,H,W]
+            m = m.unsqueeze(1)
+        if m.shape[1] == 1 and ref.shape[1] != 1:
+            m = m.expand(ref.shape[0], ref.shape[1], *m.shape[2:])
+        return m
 
     def start(self):
         self.__save_config_to_workspace()
@@ -209,17 +230,6 @@ class GenericTrainer(BaseTrainer):
             weight_dtypes=self.config.weight_dtypes(),
         )
         self.model.train_config = self.config
-
-        # --- INÍCIO DA INJEÇÃO DA INICIALIZAÇÃO DO ANALISADOR ---
-        # Instanciamos o analisador AQUI, depois que o self.model está totalmente carregado
-        if getattr(self.config, 'enable_token_grad_analyzer', False):
-            print("Ativando Token Gradient Analyzer.")
-            # Anexamos o analisador diretamente ao Trainer, que é o orquestrador.
-            self.token_analyzer = TokenGradientAnalyzer(
-                tokenizer_g=self.model.tokenizer_2,
-                log_interval=getattr(self.config, 'token_grad_log_interval', 20)
-            )
-        # --- FIM DA INJEÇÃO ---
 
         self.callbacks.on_update_status("running model setup")
 
@@ -782,24 +792,20 @@ class GenericTrainer(BaseTrainer):
                 with TorchMemoryRecorder(enabled=False):
                     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
-                    loss, loss_uncond = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
-                    
-                    # --- LÓGICA DE "ARMAR" CENTRALIZADA ---
-                    if self.token_analyzer is not None:
-                        self.token_analyzer.set_pending_analysis(
-                            step=train_progress.global_step,
-                            batch=batch,
-                            loss_uncond=loss_uncond
-                        )										
+                    predicted = model_output_data["predicted"] # bf16/fp16
 
+                    if self.config.masked_training:
+                        mask_bf16 = self.prepare_mask(batch["latent_mask"], predicted)
+                        # Hook que zera gradiente fora da máscara
+                        self.stop_grad_outside_mask(predicted, mask_bf16) # função global ou estática
+
+                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
+                    
                     loss = loss / self.config.gradient_accumulation_steps
                     if scaler:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
-
-                    if self.token_analyzer and self.token_analyzer.is_armed():
-                        self.token_analyzer.analyze_and_log(self.model)                       
 
                     has_gradient = True
                     accumulated_loss += loss.item()
@@ -838,7 +844,7 @@ class GenericTrainer(BaseTrainer):
                         accumulated_loss = 0.0
 
                         # vai tomar no cu, Nerogar
-												# self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
+                        # self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
                         if self.model.ema:
                             update_step = train_progress.global_step // self.config.gradient_accumulation_steps
                             self.tensorboard.add_scalar(

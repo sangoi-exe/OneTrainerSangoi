@@ -104,9 +104,6 @@ class StableDiffusionXLModel(BaseModel):
         self.sd_config = None
         self.sd_config_filename = None
         
-        # esquema pra analisar tokens
-        self.token_analyzer = None				
-
     def vae_to(self, device: torch.device):
         self.vae.to(device=device)
 
