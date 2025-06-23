@@ -88,6 +88,31 @@ class GenericTrainer(BaseTrainer):
 
         self.grad_hook_handles = []
 
+    @staticmethod
+    def stop_grad_outside_mask(tensor: torch.Tensor, mask_bf16: torch.Tensor) -> None:
+        """
+        Mantém o forward intacto (contexto total) e zera gradiente fora da máscara.
+        * `tensor`: saída bruta do modelo (bf16/fp16/fp32).
+        * `mask`  : mesma shape espacial, dtype float/bool (1 = região de interesse).
+        """
+        def _hook(grad: torch.Tensor) -> torch.Tensor:
+            return grad * mask_bf16       # mesmo dtype → sem crash
+        tensor.register_hook(_hook)
+
+    @staticmethod
+    def prepare_mask(
+        mask: torch.Tensor,
+        ref: torch.Tensor,
+        thresh: float = 0.5
+        ) -> torch.Tensor:
+        """Binariza + broadcasta máscara para ter shape/dtype de `ref`."""
+        m = (mask > thresh).to(dtype=ref.dtype, device=ref.device)
+        if m.ndim < ref.ndim:            # [B,H,W] → [B,1,H,W]
+            m = m.unsqueeze(1)
+        if m.shape[1] == 1 and ref.shape[1] != 1:
+            m = m.expand(ref.shape[0], ref.shape[1], *m.shape[2:])
+        return m
+
     def start(self):
         self.__save_config_to_workspace()
 
@@ -677,6 +702,13 @@ class GenericTrainer(BaseTrainer):
 
                 with TorchMemoryRecorder(enabled=False):
                     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+
+                    # predicted = model_output_data["predicted"] # bf16/fp16
+
+                    # if self.config.masked_training:
+                    #     mask_bf16 = self.prepare_mask(batch["latent_mask"], predicted)
+                    #     # Hook que zera gradiente fora da máscara
+                    #     self.stop_grad_outside_mask(predicted, mask_bf16) # função global ou estática
 
                     loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
 
