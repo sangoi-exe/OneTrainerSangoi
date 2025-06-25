@@ -3,9 +3,8 @@ from collections import defaultdict
 import time
 from modules.util import torch_util  # Importamos nosso utilitário com o accelerator global
 
-
 class TokenGradientAnalyzer:
-    def __init__(self, tokenizer_g, log_interval=100, top_k=5):
+    def __init__(self, tokenizer_g, log_interval=2, top_k=5):
         """
         Inicializa o analisador.
         :param tokenizer_g: O tokenizer do CLIP-G (geralmente tokenizer_2).

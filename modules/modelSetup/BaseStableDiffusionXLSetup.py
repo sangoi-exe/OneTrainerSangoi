@@ -243,12 +243,9 @@ class BaseStableDiffusionXLSetup(
 								tokens_2=batch['tokens_2'],
 								text_encoder_1_layer_skip=config.text_encoder_layer_skip,
 								text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
-								text_encoder_1_output=batch[
-										'text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
-								text_encoder_2_output=batch[
-										'text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
-								pooled_text_encoder_2_output=batch[
-										'text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
+								text_encoder_1_output=batch['text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
+								text_encoder_2_output=batch['text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
+								pooled_text_encoder_2_output=batch['text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
 								text_encoder_1_dropout_probability=config.text_encoder.dropout_probability,
 								text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability,
 						)
@@ -443,7 +440,7 @@ class BaseStableDiffusionXLSetup(
 												train_device=self.train_device,
 												batch_size=batch['latent_image'].shape[0],
 												rand=rand,
-												text="",                 # prompt vazio = caminho uncond
+												text="",
 										)
 
 								# Movemos explicitamente para o device de treino (GPU)
@@ -454,9 +451,6 @@ class BaseStableDiffusionXLSetup(
 								uncond_text_encoder_output = uncond_text_encoder_output.expand(latent_input.shape[0], -1, -1)
 								uncond_pooled_text_encoder_output = uncond_pooled_text_encoder_output.expand(latent_input.shape[0], -1)
 
-								# HACK BRUTAL: Re-anexamos o gradiente. Isso pode funcionar.
-								uncond_text_encoder_output.requires_grad_(True)
-
 								uncond_added_cond_kwargs = {"text_embeds": uncond_pooled_text_encoder_output, "time_ids": add_time_ids}
 								
 								# Agora a UNet recebe tensores no mesmo device
@@ -466,11 +460,6 @@ class BaseStableDiffusionXLSetup(
 										encoder_hidden_states=uncond_text_encoder_output.to(dtype=model.train_dtype.torch_dtype()),
 										added_cond_kwargs=uncond_added_cond_kwargs,
 								).sample
-								# --- FIM DA INJEÇÃO ---
-
-								# --- FIM DA INJEÇÃO ---
-
-
 
 								model_output_data = {}
 
