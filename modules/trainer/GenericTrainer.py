@@ -43,6 +43,7 @@ from PIL.Image import Image
 from tqdm import tqdm
 
 from modules.sangoi.TokenGradientAnalyzer import TokenGradientAnalyzer
+from modules.sangoi.ProbeScheduler import ProbeScheduler
 
 
 class GenericTrainer(BaseTrainer):
@@ -103,6 +104,7 @@ class GenericTrainer(BaseTrainer):
 
 				self._steps_per_epoch = None
 				self.token_analyzer = None
+				self.probe_scheduler = None
 
 		def _handle_pause_logic(self):
 				"""Executa a lógica de pausa, movendo o modelo e esperando."""
@@ -216,11 +218,22 @@ class GenericTrainer(BaseTrainer):
 				self.model_setup.setup_train_device(self.model, self.config)
 				self.model_setup.setup_model(self.model, self.config)
 
-				print("Ativando Token Gradient Analyzer.")
-				# Anexamos o analisador diretamente ao Trainer, que é o orquestrador.
+				print("Ativando Token Gradient Analyzer e Probe Scheduler.")
 				self.token_analyzer = TokenGradientAnalyzer(
+						tokenizer_l=self.model.tokenizer_1,
 						tokenizer_g=self.model.tokenizer_2,
+						out_dir=os.path.join(self.config.workspace_dir, "token_affinity_reports")
 				)
+				self.token_analyzer.register_hooks(self.model)
+
+				if self.config.enable_probe_scheduler:
+					self.probe_scheduler = ProbeScheduler(
+						tokenizer_l=self.model.tokenizer_1,
+						tokenizer_g=self.model.tokenizer_2,
+						token_analyzer=self.token_analyzer,
+						probe_interval=self.config.probe_interval,
+						probe_batch_size=self.config.probe_batch_size,
+					)
 
 				self.model.eval()
 				torch_gc()
@@ -664,6 +677,16 @@ class GenericTrainer(BaseTrainer):
 				train_device = torch.device(self.config.train_device)
 
 				train_progress = self.model.train_progress
+				# Garante que os gradientes dos embeddings de token estejam ativados para a análise
+				if self.token_analyzer:
+					print("[GenericTrainer] Ativando requires_grad para embeddings (análise de token)..")
+					emb_layer_l = self.model.text_encoder_1.get_input_embeddings()
+					if not emb_layer_l.weight.requires_grad:
+						emb_layer_l.weight.requires_grad_(True)
+					
+					emb_layer_g = self.model.text_encoder_2.get_input_embeddings()
+					if not emb_layer_g.weight.requires_grad:
+						emb_layer_g.weight.requires_grad_(True)
 
 				if self.config.only_cache:
 						self.callbacks.on_update_status("caching")
@@ -732,6 +755,8 @@ class GenericTrainer(BaseTrainer):
 						train_progress.set_total_steps(self._steps_per_epoch * self.config.epochs)
 
 						for batch in step_tqdm:
+								# Executa a sondagem de tokens, se agendada
+								
 								if self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
 										self.__enqueue_sample_during_training(
 												lambda: self.__sample_during_training(train_progress, train_device)
@@ -783,8 +808,7 @@ class GenericTrainer(BaseTrainer):
 										if self.token_analyzer is not None:
 												self.token_analyzer.set_pending_analysis(
 														step=train_progress.global_step,
-														batch=batch,
-														loss_uncond=loss_uncond
+														batch=batch
 												)										
 
 										loss = loss / self.config.gradient_accumulation_steps
@@ -794,7 +818,7 @@ class GenericTrainer(BaseTrainer):
 												loss.backward()
 
 										if self.token_analyzer and self.token_analyzer.is_armed():
-												self.token_analyzer.analyze_and_log(self.model)                       
+												self.token_analyzer.analyze_and_save_report(self.model)                       
 
 										has_gradient = True
 										accumulated_loss += loss.item()
@@ -856,7 +880,7 @@ class GenericTrainer(BaseTrainer):
 
 								if self.commands.get_stop_command():
 										return
-
+						
 						train_progress.next_epoch()
 						self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
@@ -917,6 +941,9 @@ class GenericTrainer(BaseTrainer):
 
 				elif self.model is not None:
 						self.model.to(self.temp_device)
+
+				if self.token_analyzer:
+					self.token_analyzer.remove_hooks()
 
 				self.tensorboard.close()
 

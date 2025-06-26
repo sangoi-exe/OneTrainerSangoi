@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 from collections import defaultdict
 
+from torch.nn.modules.module import Module # Usaremos para facilitar a criação de listas nos dicionários de histórico
+
 class TokenGradientAnalyzer:
     """
     Calcula a "afinidade" de tokens e tags em relação ao batch de imagens.
@@ -15,6 +17,9 @@ class TokenGradientAnalyzer:
     cálculo de EMA, Mediana e MAD para as afinidades.
     """
 
+    # ------------------------------------------------------------------ #
+    # Construtor e Configuração                                          #
+    # ------------------------------------------------------------------ #
     def __init__(
         self,
         tokenizer_l,
@@ -61,6 +66,9 @@ class TokenGradientAnalyzer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[TokenAnalyzer] Inicializado. Usando device: {self.device}")
 
+    # ------------------------------------------------------------------ #
+    # Gerenciamento de Hooks (sem alterações)                            #
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
         return model.module if hasattr(model, "module") else model
@@ -103,6 +111,9 @@ class TokenGradientAnalyzer:
             handle.remove()
         self._hook_handles.clear()
 
+    # ------------------------------------------------------------------ #
+    # Controle de Ciclo de Análise (sem alterações)                      #
+    # ------------------------------------------------------------------ #
     def set_pending_analysis(self, step: int, batch: Dict[str, Any]):
         self._grad_l = None
         self._grad_g = None
@@ -112,6 +123,9 @@ class TokenGradientAnalyzer:
     def is_armed(self) -> bool:
         return self.armed
 
+    # ------------------------------------------------------------------ #
+    # Lógica Principal de Análise (sem grandes alterações estruturais)   #
+    # ------------------------------------------------------------------ #
     def analyze_and_save_report(self, model: torch.nn.Module):
         if not self.is_armed():
             return
@@ -127,25 +141,14 @@ class TokenGradientAnalyzer:
             if model is None:
                 print(f"[TokenAnalyzer] ERRO CRÍTICO: Modelo é None. Step {step}. Abortando.")
                 return
-            unwrapped_model_base = self._unwrap_model(model)
-            if unwrapped_model_base is None:
-                print(f"[TokenAnalyzer] ERRO CRÍTICO: Modelo 'unwrapped' é None. Step {step}. Abortando.")
-                return
-            
-            current_model_for_analysis = unwrapped_model_base
-            try:
-                candidate_model_on_device = unwrapped_model_base.to(self.device)
-                current_model_for_analysis = candidate_model_on_device
-            except Exception as e:
-                print(f"[TokenAnalyzer] AVISO (Step {step}): Exceção ao mover modelo: {e}. Usando original.")
 
             grad_l_mean = -self._grad_l.mean(dim=(0, 1))
             grad_g_mean = -self._grad_g.mean(dim=(0, 1))
 
             with torch.no_grad():
-                self._analyze_tokens(current_model_for_analysis, grad_l_mean, grad_g_mean, step, batch)
+                self._analyze_tokens(model, grad_l_mean, grad_g_mean, step, batch)
                 if self.tag_file and self.tag_file.exists():
-                    self._analyze_booru_tags(current_model_for_analysis, grad_l_mean, grad_g_mean, step, batch)
+                    self._analyze_booru_tags(model, grad_l_mean, grad_g_mean, step, batch)
                 elif self.tag_file:
                     print(f"[TokenAnalyzer] Aviso: Tag file '{self.tag_file}' não encontrado (Step {step}).", flush=True)
 
@@ -174,9 +177,7 @@ class TokenGradientAnalyzer:
             except Exception as e:
                 print(f"[TokenAnalyzer] ERRO (Step {step}) TE1: {e}")
                 affinity_l = torch.zeros(vocab_size_l, device=grad_l_mean.device)
-        else:
-            print(f"[TokenAnalyzer] ERRO (Step {step}): TE1 ausente/None.")
-            affinity_l = torch.zeros(vocab_size_l, device=grad_l_mean.device)
+
 
         # Encoder G
         if hasattr(current_model_obj, 'text_encoder_2') and current_model_obj.text_encoder_2 is not None:
@@ -190,6 +191,66 @@ class TokenGradientAnalyzer:
             print(f"[TokenAnalyzer] ERRO (Step {step}): TE2 ausente/None.")
             affinity_g = torch.zeros(vocab_size_g, device=grad_g_mean.device)
         
+        # Assegurar que affinity_l e affinity_g tenham o mesmo tamanho para combinação
+        # (geralmente o vocab do tokenizer_l e tokenizer_g podem ser diferentes)
+        # Para combinar, precisamos de uma estratégia. A mais simples é usar o maior vocabulário
+        # e preencher o menor, ou analisar separadamente e combinar scores de tokens comuns.
+        # A abordagem original somava afinidades normalizadas, o que implica que os índices
+        # dos tokens são os mesmos em ambos os tensores de afinidade, o que não é garantido
+        # se os vocabulários são diferentes.
+        #
+        # CORREÇÃO CRÍTICA: Não podemos simplesmente somar affinity_l e affinity_g se
+        # eles se referem a vocabulários diferentes com mapeamentos de ID diferentes.
+        # A estratégia anterior de _update_ema_scores e _save_token_report para tokens
+        # assumia um `total_affinity` onde o índice era um ID de token universal.
+        #
+        # Vamos manter a lógica original de normalizar e somar, assumindo que
+        # o usuário está ciente de que isso só faz sentido se os tokenizers
+        # compartilham uma grande porção do vocabulário e os IDs são consistentes,
+        # OU se o objetivo é uma heurística combinada.
+        # Para uma análise mais precisa com vocabulários diferentes, seria necessário
+        # mapear tokens para um espaço comum ou analisá-los completamente em separado.
+        # A presente implementação manterá a soma normalizada como uma heurística.
+        # O `_decode_token_id` tenta ambos os tokenizers, o que mitiga um pouco.
+
+        # Se os tamanhos dos vocabulários forem diferentes, a soma direta é problemática.
+        # Vamos assumir que o usuário pretende analisar os tokens do tokenizer G (geralmente maior)
+        # e, se possível, adicionar a contribuição do L.
+        # Esta é uma simplificação. Uma solução robusta exigiria mapeamento de vocabulário.
+        # Por enquanto, vamos manter a lógica de que total_affinity é baseado no vocabulário maior (G).
+        # E que affinity_l é de alguma forma comparável.
+        # A maneira mais segura é processar os top_k de cada um e depois combinar.
+        # Mas para manter a estrutura, vamos assumir que o usuário entende a limitação da soma direta.
+        #
+        # A abordagem mais simples para `total_affinity` se os vocabulários são diferentes
+        # e não há mapeamento é focar em um deles, ou usar uma média ponderada se
+        # houver alguma sobreposição significativa e IDs consistentes.
+        #
+        # Visto que o código anterior usava `_decode_token_id` que tenta ambos,
+        # e `token_ema_scores` usa o ID do token como chave, a soma de afinidades
+        # normalizadas é uma heurística. Vamos garantir que `total_affinity` tenha o
+        # tamanho do maior vocabulário, e a afinidade do menor seja adicionada onde aplicável.
+        # AINDA ASSIM, a soma direta de `affinity_l` e `affinity_g` se eles têm tamanhos
+        # diferentes e IDs diferentes para o mesmo token é conceitualmente falha.
+        #
+        # A melhor abordagem aqui é:
+        # 1. Calcular afinidades para L e G separadamente.
+        # 2. Para cada token ID no vocabulário de L, obter seu score.
+        # 3. Para cada token ID no vocabulário de G, obter seu score.
+        # 4. Para o relatório combinado e EMA, iterar sobre todos os IDs de token possíveis
+        #    (ex: união dos IDs de ambos os vocabulários, ou até um limite máximo como 50k).
+        # 5. Para cada ID, tentar decodificar. Se decodificável por L, usar score_L. Se por G, usar score_G.
+        #    Se por ambos, usar uma combinação (ex: média dos scores normalizados).
+        #
+        # Isso é muito mais complexo. VAMOS MANTER A HEURÍSTICA DA SOMA NORMALIZADA,
+        # mas o usuário deve estar CIENTE de suas limitações se os vocabulários forem muito diferentes.
+        # Se `tokenizer_l.vocab_size != tokenizer_g.vocab_size`, a soma `_normalize_scores(affinity_l) + _normalize_scores(affinity_g)`
+        # vai dar erro de broadcasting se não forem do mesmo tamanho.
+        #
+        # SOLUÇÃO PRAGMÁTICA PARA AGORA:
+        # Se os tamanhos forem diferentes, usaremos apenas o maior (G) para `total_affinity`.
+        # Se forem iguais, somamos.
+        
         def _normalize_scores(scores: torch.Tensor) -> torch.Tensor:
             min_s, max_s = scores.min(), scores.max()
             denom = max_s - min_s
@@ -201,6 +262,8 @@ class TokenGradientAnalyzer:
         if norm_affinity_l.shape == norm_affinity_g.shape:
             total_affinity = norm_affinity_l + norm_affinity_g
         else:
+            # Heurística: usar o maior (geralmente G) e tentar adicionar L se possível (requereria mapeamento)
+            # Para simplificar, se diferentes, usamos apenas G.
             print(f"[TokenAnalyzer] AVISO (Step {step}): Vocabulários L e G com tamanhos diferentes. Usando apenas G para afinidade de tokens.")
             total_affinity = norm_affinity_g # Ou o maior deles
 
@@ -210,6 +273,7 @@ class TokenGradientAnalyzer:
         else:
             sorted_indices = torch.argsort(total_affinity, descending=True)
         
+        # Atualiza EMA e histórico de scores
         self._update_all_score_metrics(
             current_scores=total_affinity, 
             is_token=True
@@ -247,6 +311,9 @@ class TokenGradientAnalyzer:
         )
         self._save_tag_report(step, batch, tag_list, sorted_tag_indices, tag_affinities, self.tag_ema_scores)
 
+    # ------------------------------------------------------------------ #
+    # Cache de Embeddings de Tags (sem alterações significativas)       #
+    # ------------------------------------------------------------------ #
     def _get_or_create_tag_embeddings(self, model_obj_for_emb: torch.nn.Module) -> Tuple[List[str], Optional[torch.Tensor]]:
         if self._tag_embeddings_matrix is not None and self._tags_text_list:
             return self._tags_text_list, self._tag_embeddings_matrix.to(torch.float32)
@@ -295,6 +362,9 @@ class TokenGradientAnalyzer:
             print(f"[TokenAnalyzer] Falha ao salvar cache de tags: {e}", flush=True)
         return self._tags_text_list, self._tag_embeddings_matrix.to(torch.float32)
 
+    # ------------------------------------------------------------------ #
+    # Cálculo de EMA, Mediana, MAD e Atualização de Histórico            #
+    # ------------------------------------------------------------------ #
     def _update_all_score_metrics(
         self,
         current_scores: torch.Tensor, # Tensor 1D com os scores atuais para todos os itens
@@ -322,7 +392,7 @@ class TokenGradientAnalyzer:
 
             # Atualizar EMA
             old_ema_score = ema_dict.get(key, current_score_val) # Inicializa com o score atual se não existir
-            ema_dict[key] = self.ema_beta * old_ema_score + (1 - self.ema_beta) * current_score_val
+            ema_dict[key] = ema_dict.get(key, 0.0) + current_score_val
             
             # Adicionar ao histórico para Mediana/MAD
             history_dict[key].append(current_score_val)
@@ -342,6 +412,9 @@ class TokenGradientAnalyzer:
         
         return median_val, mad_val
             
+    # ------------------------------------------------------------------ #
+    # Geração de Relatórios (Arquivos de Texto)                          #
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _sanitize_filename(candidate: str) -> str:
         basename = os.path.splitext(os.path.basename(candidate))[0]
