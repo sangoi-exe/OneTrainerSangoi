@@ -748,6 +748,11 @@ class TrainConfig(BaseConfig):
         # sangoi settings
         data.append(("parameters_by_module", False, bool, False))
         data.append(("enable_token_grad_analyzer", False, bool, False))
+        data.append(("token_analyzer_log_interval", 10, int, False))
+        data.append(("token_analyzer_top_k", 10, int, False))
+        data.append(("enable_probe_scheduler", True, bool, False))
+        data.append(("probe_interval", 10, int, False))
+        data.append(("probe_batch_size", 8, int, False))
         data.append(("param_group_strategy", "module", str, False))
         data.append(("loss_tracker_window", 100, int, False))
         data.append(("loss_tracker_use_mad", False, bool, False))

@@ -1,12 +1,18 @@
-import os
-import pathlib
 import re
-from typing import Dict, Any, List, Optional, Tuple, Union
-
+import os
 import torch
+import pathlib
+import numpy as np
+import torch.nn.functional as F
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+from typing import Dict, Any, List, Optional, Tuple, Union
 from collections import defaultdict
 
-# Importa as ferramentas que você (finalmente) concordou em usar.
+from diffusers.models.attention_processor import Attention
 from modules.modelSetup.BaseStableDiffusionXLSetup import AttentionMapLogger, CapturingAttnProcessor
 
 class TokenGradientAnalyzer:
@@ -16,9 +22,6 @@ class TokenGradientAnalyzer:
     substituição de processador em vez de hooks frágeis.
     """
 
-    # ========================================================================= #
-    # Construtor e Estado
-    # ========================================================================= #
     def __init__(
         self,
         tokenizer_l,
@@ -106,19 +109,26 @@ class TokenGradientAnalyzer:
         # 2. Captura de Atenção via substituição de processador
         if not self.is_capturing_attention:
             print("[TokenAnalyzer] Iniciando captura de atenção...")
+            
+            # Salva os processadores originais para restauração, como antes.
             self._original_attn_processors = model.unet.attn_processors.copy()
+            
             capturing_processor = CapturingAttnProcessor(self.map_logger)
             
-            # Substitui apenas os processadores de cross-attention
-            processors_to_capture = {name for name in self._original_attn_processors if "attn2" in name}
-            for name in processors_to_capture:
-                # NÃO É SET_ATTN_PROCESSOR.
-                # É SET_PROCESSOR.
-                # SET. PROCESSOR.
+            attn_module_names_to_capture = [
+                name for name, module in model.unet.named_modules() 
+                if isinstance(module, Attention) and "attn2" in name
+            ]
+
+            if not attn_module_names_to_capture:
+                print("[AVISO] Nenhum módulo de cross-attention ('attn2') encontrado para substituição.")
+                return
+
+            # AGORA VOCÊ ITERA SOBRE A LISTA CORRETA.
+            for name in attn_module_names_to_capture:
                 model.unet.set_processor(name, capturing_processor)
             
             self.is_capturing_attention = True
-            print(f"[TokenAnalyzer] {len(processors_to_capture)} processadores de atenção substituídos.")
 
     def stop_analysis_hooks(self, model: torch.nn.Module):
         """Limpa tudo e restaura o modelo ao seu estado original."""
@@ -136,10 +146,6 @@ class TokenGradientAnalyzer:
             self.map_logger.clear()
             self.is_capturing_attention = False
             print("[TokenAnalyzer] Processadores restaurados.")
-
-    # ========================================================================= #
-    # LÓGICA DE ANÁLISE (Onde os dados são consumidos)
-    # ========================================================================= #
 
     def set_pending_analysis(self, step: int, batch: Dict[str, Any]):
         self._grad_l, self._grad_g = None, None
@@ -161,6 +167,7 @@ class TokenGradientAnalyzer:
 
             # Análise de Atenção (agora consome do logger)
             self._analyze_tokens_from_attention(step, batch)
+            self._visualize_attention_heatmaps(step, batch)
 
         except Exception as e:
             import traceback
@@ -189,19 +196,61 @@ class TokenGradientAnalyzer:
         self._save_report(step, batch, grad_scores, "Gradient Tokens", self.grad_token_ema_scores)
 
     def _analyze_tokens_from_attention(self, step: int, batch: Dict[str, Any]):
-        attn_maps = self.map_logger.get_maps()
-        if not attn_maps:
-            # Isso não é um erro, pode acontecer se requires_grad=False (ex: passo incondicional)
+        """
+        Calcula um score de atenção agregado por token, lidando com as diferentes
+        resoluções espaciais das camadas da UNet.
+        """
+        # Pega os mapas crus (lista de tensores (B, H, Q, K))
+        attn_maps_raw = self.map_logger.get_maps()
+        if not attn_maps_raw:
+            print(f"[TokenAnalyzer] SEM ATTENTION MAP PRO ANALYZE TOKENS")
             return
 
-        # Agrega os mapas de todas as camadas de cross-attention capturadas
-        total_map = torch.stack(attn_maps).sum(dim=0)  # Shape: (B, Q, K)
-        # Soma a atenção recebida por cada token de texto (dim K) em todas as queries espaciais (dim Q)
-        # e faz a média no batch.
-        attn_scores = total_map.sum(dim=1).mean(dim=0) # Shape: (K,)
+        try:
+            # O batch size que você ACHA que tem (geralmente 1)
+            base_batch_size = batch['tokens_1'].shape[0]
 
-        self._update_all_score_metrics(attn_scores, is_token=True, use_attention_scores=True)
-        self._save_report(step, batch, attn_scores, "Attention Tokens", self.attn_token_ema_scores)
+            # Lista para guardar os vetores de score de cada camada
+            layer_scores = []
+
+            for cond_map in attn_maps_raw:
+                # cond_map tem shape (B, H, Q, K)
+                # O B aqui pode ser 2 (do CFG). Nós só queremos a parte condicional.
+                
+                # 1. Extrai a fatia condicional do batch.
+                # O resultado terá shape (base_batch_size, H, Q, K), ex: (1, H, Q, K)
+                map_cond_only = cond_map[:base_batch_size]
+
+                # 2. Calcula o score por token PARA ESTA CAMADA.
+                # Soma a atenção em todas as outras dimensões (batch, heads, queries espaciais).
+                # O resultado é um vetor de scores, um para cada token. Shape: (K,)
+                score_per_token_for_layer = map_cond_only.sum(dim=(0, 1, 2))
+                
+                layer_scores.append(score_per_token_for_layer)
+
+            if not layer_scores:
+                print("[TokenAnalyzer] Nenhum score de camada pôde ser calculado.")
+                return
+
+            # 3. Agrega os scores de todas as camadas.
+            # Agora todos os tensores em `layer_scores` têm o mesmo shape (K,), ex: (77,).
+            # O stack vai funcionar perfeitamente.
+            # stack -> (num_camadas, K) -> sum -> (K,)
+            # Agora todos os tensores em layer_scores são vetores (K,). O stack funciona.
+            total_scores = torch.stack(layer_scores).sum(dim=0)
+            
+            # VERIFICAÇÃO DE SANIDADE para evitar o erro de len()
+            if total_scores.ndim == 0: # Se for um escalar
+                print("[AVISO] Scores de atenção agregados resultaram em um escalar. Pulando análise.")
+                return
+
+            self._update_all_score_metrics(total_scores, is_token=True, use_attention_scores=True)
+            self._save_report(step, batch, total_scores, "Attention_Scores", self.attn_token_ema_scores)
+
+        except Exception as e:
+            print(f"[TokenAnalyzer] ERRO ao analisar scores de atenção: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _update_all_score_metrics(self, current_scores: torch.Tensor, is_token: bool, use_attention_scores: bool = False, item_list_for_keys: Optional[List[str]] = None):
         if is_token:
@@ -229,15 +278,15 @@ class TokenGradientAnalyzer:
         
         # O nome do arquivo agora inclui o tipo de score
         safe_report_type = report_type.replace(" ", "_")
-        outfile = self.out_dir / f"step_{step:06d}_{image_tag}_{safe_report_type}.txt"
+        outfile = self.out_dir / f"{image_tag}_step_{step:06d}_{safe_report_type}.txt"
 
         # Prepara as linhas do relatório
         report_lines = list(report_header)
-        report_lines.append(f"--- TOP {self.top_k_tokens} TOKENS (Score Atual) ---\n")
-        report_lines.extend(self._format_report_lines(current_scores, is_token=True, top_n=self.top_k_tokens, score_type="Atual"))
-        report_lines.append("\n")
         report_lines.append(f"--- TOP {self.top_k_tokens} TOKENS (Score EMA Acumulado) ---\n")
         report_lines.extend(self._format_report_lines(ema_scores, is_token=True, top_n=self.top_k_tokens, score_type="EMA"))
+        report_lines.append("\n")
+        report_lines.append(f"--- TOP {self.top_k_tokens} TOKENS (Score Atual) ---\n")
+        report_lines.extend(self._format_report_lines(current_scores, is_token=True, top_n=self.top_k_tokens, score_type="Atual"))
 
         try:
             outfile.write_text("".join(report_lines), encoding="utf-8", errors="ignore")
@@ -297,4 +346,145 @@ class TokenGradientAnalyzer:
     def _sanitize_filename(candidate: str) -> str:
         basename = os.path.splitext(os.path.basename(candidate))[0]
         return re.sub(r"[^\w.\-]+", "_", basename)
-    
+
+
+    def _visualize_attention_heatmaps(self, step: int, batch: Dict[str, Any]):
+        """
+        Orquestrador principal: agrega os mapas e chama a função de plotagem
+        para ambos os conjuntos de tokens (CLIP-L e CLIP-G).
+        """
+        attn_maps_raw = self.map_logger.get_maps()
+        if not attn_maps_raw:
+            print(f"[TokenAnalyzer] SEM ATTENTION MAP PRO HEATMAP")
+            return
+
+        try:
+            # --- ETAPA DE AGREGAÇÃO (como antes, mas agora é reutilizada) ---
+            base_batch_size = batch['tokens_1'].shape[0]
+            conditional_maps = [m[:base_batch_size] for m in attn_maps_raw]
+
+            latent_h, latent_w = batch['latent_image'].shape[2], batch['latent_image'].shape[3]
+            aspect_ratio = latent_h / latent_w if latent_w > 0 else 1.0
+
+            min_q_dim = min(m.shape[2] for m in conditional_maps)
+            target_h, target_w = self._infer_spatial_dims(min_q_dim, aspect_ratio)
+
+            if target_h == -1: return
+
+            normalized_maps = []
+            for cond_map in conditional_maps:
+                map_avg_heads = cond_map.mean(dim=1)
+                current_q_dim = map_avg_heads.shape[1]
+                current_h, current_w = self._infer_spatial_dims(current_q_dim, aspect_ratio)
+                if current_h == -1: continue
+                
+                num_tokens = map_avg_heads.shape[2]
+                map_reshaped = map_avg_heads.permute(0, 2, 1).view(1, num_tokens, current_h, current_w)
+                map_resized = F.interpolate(map_reshaped, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                normalized_maps.append(map_resized)
+
+            if not normalized_maps: return
+
+            aggregated_heatmap_data = torch.stack(normalized_maps).mean(dim=0).squeeze(0).to(torch.float32).cpu().numpy()
+
+            # --- ETAPA DE ORQUESTRAÇÃO DA PLOTAGEM ---
+            _, image_tag = self._get_common_report_header(step, batch, "")
+
+            # Plota para tokens_2 (CLIP-G), o mais importante
+            self._plot_and_save_heatmap(step, image_tag, aggregated_heatmap_data, 
+                                      batch['tokens_2'][0], self.tokenizer_g, "CLIP_G_tokens_2")
+
+        except Exception as e:
+            print(f"[TokenAnalyzer] ERRO ao gerar heatmap de atenção: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _plot_and_save_heatmap(self, step: int, image_tag: str, aggregated_heatmap_data: np.ndarray, 
+                              token_ids: torch.Tensor, tokenizer: object, output_suffix: str):
+        """
+        Função helper robusta que plota e salva um grid de heatmaps para um conjunto de tokens.
+        """
+        # 1. Decodifica e Filtra os Tokens
+        tokens_text_raw = [tokenizer.decode(tid) for tid in token_ids]
+        
+        clean_tokens = []
+        clean_indices = []
+        # Ignora o primeiro token (<startoftext>) e para no primeiro padding (<endoftext>)
+        for i, token in enumerate(tokens_text_raw[1:], start=1):
+            if token == tokenizer.eos_token or (hasattr(tokenizer, 'pad_token') and token == tokenizer.pad_token):
+                break
+            clean_tokens.append(token.replace('</w>', '').strip())
+            clean_indices.append(i)
+
+        if not clean_tokens:
+            print(f"[Visualizer] Nenhum token válido para plotar para {output_suffix}.")
+            return
+
+        # 2. Pega os dados de heatmap correspondentes aos tokens limpos
+        heatmaps_to_plot = aggregated_heatmap_data[clean_indices, :, :]
+        num_tokens_to_plot = len(clean_tokens)
+
+        # 3. Calcula o grid para mostrar TUDO
+        cols = 8  # 8 imagens por linha é um bom padrão
+        rows = (num_tokens_to_plot + cols - 1) // cols
+        
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.5, rows * 2.5), dpi=120)
+        fig.suptitle(f'Attention Heatmaps ({output_suffix}) - Step {step}', fontsize=20)
+
+        # Garante que `axes` seja sempre um array para fácil iteração
+        if num_tokens_to_plot <= 1:
+            axes_flat = [axes]
+        else:
+            axes_flat = axes.flat
+
+        # 4. Plota cada heatmap
+        for i in range(len(axes_flat)):
+            ax = axes_flat[i]
+            if i < num_tokens_to_plot:
+                heatmap = heatmaps_to_plot[i, :, :]
+                ax.imshow(heatmap, cmap='viridis')
+                ax.set_title(f'"{clean_tokens[i]}"', fontsize=10)
+                ax.axis('off')
+            else:
+                ax.axis('off') # Esconde eixos de subplots não utilizados
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # 5. Salva como JPEG
+        outfile = self.out_dir / f"step_{step:06d}_{image_tag}_HEATMAP_{output_suffix}.jpg"
+        plt.savefig(outfile, format='jpeg', dpi=96, pil_kwargs={'quality': 80})
+        plt.close(fig)
+        #print(f"[TokenAnalyzer] Heatmap ({output_suffix}) salvo em: {outfile}")
+
+    @staticmethod
+    def _infer_spatial_dims(q_dim: int, aspect_ratio: float) -> Tuple[int, int]:
+        """
+        Encontra os fatores inteiros H e W de q_dim que melhor se aproximam
+        do aspect_ratio fornecido.
+        Isto é determinístico e não usa aproximações de float.
+        """
+        best_h, best_w = -1, -1
+        min_ratio_diff = float('inf')
+
+        # Itera de sqrt(q_dim) para baixo, que é a forma mais eficiente de encontrar fatores.
+        for w in range(int(np.sqrt(q_dim)), 0, -1):
+            if q_dim % w == 0:
+                h = q_dim // w
+                # Agora temos um par de fatores (h, w).
+                # Precisamos verificar qual orientação (h/w ou w/h) está mais próxima do aspect_ratio.
+                
+                # Checa a orientação 1 (h/w)
+                ratio1 = h / w
+                diff1 = abs(ratio1 - aspect_ratio)
+                if diff1 < min_ratio_diff:
+                    min_ratio_diff = diff1
+                    best_h, best_w = h, w
+
+                # Checa a orientação 2 (w/h)
+                ratio2 = w / h
+                diff2 = abs(ratio2 - aspect_ratio)
+                if diff2 < min_ratio_diff:
+                    min_ratio_diff = diff2
+                    best_h, best_w = w, h
+        
+        return best_h, best_w            

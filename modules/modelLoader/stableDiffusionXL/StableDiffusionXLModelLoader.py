@@ -1,6 +1,8 @@
 import os
 import traceback
 
+
+
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
 from modules.modelLoader.mixin.SDConfigModelLoaderMixin import SDConfigModelLoaderMixin
@@ -286,16 +288,20 @@ class StableDiffusionXLModelLoader(
         raise Exception("could not load model: " + model_names.base_model)
     
 
-    # 1. Defina a função que você quer que exista na UNet
     @staticmethod
-    def _set_single_processor(unet_instance, name: str, processor: object):
+    def _set_single_processor(unet_instance, name: str, new_processor: object):
         """
-        Esta função será injetada na instância da UNet.
-        Ela agora modifica o dicionário `attn_processors` DIRETAMENTE.
+        Função injetada na UNet. À prova de idiotas.
         """
-        # O dicionário de processadores já existe na instância da UNet.
-        # Nós simplesmente o acessamos.
-        if name in unet_instance.attn_processors:
-            unet_instance.attn_processors[name] = processor
-        else:
-            print(f"[AVISO] Tentativa de setar processador para o nome '{name}', que não foi encontrado em attn_processors.")
+        try:
+            # Pega a referência para o módulo de atenção.
+            attn_module = unet_instance.get_submodule(name)
+
+            if not isinstance(attn_module, Attention):
+                return # Ignora silenciosamente se não for um módulo de atenção.
+
+            # 2. Executa a porra da substituição.
+            attn_module.set_processor(new_processor)
+            
+        except Exception as e:
+            print(f"[ERRO DE INJEÇÃO] Falha catastrófica ao tentar setar '{name}': {e}")
