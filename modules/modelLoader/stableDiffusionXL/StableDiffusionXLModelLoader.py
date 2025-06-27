@@ -19,6 +19,8 @@ from diffusers import (
 )
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
+from types import MethodType
+from diffusers.models.attention_processor import Attention
 
 class StableDiffusionXLModelLoader(
     SDConfigModelLoaderMixin,
@@ -127,6 +129,11 @@ class StableDiffusionXLModelLoader(
         model.text_encoder_2 = text_encoder_2
         model.vae = vae
         model.unet = unet
+        
+        # 2. Injete essa função na SUA instância da UNet
+        # Isso NÃO modifica o arquivo do diffusers. Só afeta o objeto `self.model.unet` em memória.
+        model.unet.set_processor = MethodType(self._set_single_processor, model.unet)
+        print("[INFO] Método 'set_processor' injetado na instância da UNet com sucesso. EM LOAD_DIFFUSERS")
 
     def __load_ckpt(
             self,
@@ -168,6 +175,11 @@ class StableDiffusionXLModelLoader(
         model.text_encoder_2 = text_encoder_2
         model.vae = vae
         model.unet = unet
+
+        # 2. Injete essa função na SUA instância da UNet
+        # Isso NÃO modifica o arquivo do diffusers. Só afeta o objeto `self.model.unet` em memória.
+        model.unet.set_processor = MethodType(self._set_single_processor, model.unet)
+        print("[INFO] Método 'set_processor' injetado na instância da UNet com sucesso. EM LOAD_CKPT")
 
     def __load_safetensors(
             self,
@@ -228,6 +240,11 @@ class StableDiffusionXLModelLoader(
         model.vae = vae
         model.unet = unet
 
+        # 2. Injete essa função na SUA instância da UNet
+        # Isso NÃO modifica o arquivo do diffusers. Só afeta o objeto `self.model.unet` em memória.
+        model.unet.set_processor = MethodType(self._set_single_processor, model.unet)
+        print("[INFO] Método 'set_processor' injetado na instância da UNet com sucesso. EM LOAD_SAFETENSORS")
+
     def load(
             self,
             model: StableDiffusionXLModel,
@@ -267,3 +284,18 @@ class StableDiffusionXLModelLoader(
         for stacktrace in stacktraces:
             print(stacktrace)
         raise Exception("could not load model: " + model_names.base_model)
+    
+
+    # 1. Defina a função que você quer que exista na UNet
+    @staticmethod
+    def _set_single_processor(unet_instance, name: str, processor: object):
+        """
+        Esta função será injetada na instância da UNet.
+        Ela agora modifica o dicionário `attn_processors` DIRETAMENTE.
+        """
+        # O dicionário de processadores já existe na instância da UNet.
+        # Nós simplesmente o acessamos.
+        if name in unet_instance.attn_processors:
+            unet_instance.attn_processors[name] = processor
+        else:
+            print(f"[AVISO] Tentativa de setar processador para o nome '{name}', que não foi encontrado em attn_processors.")

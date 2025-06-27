@@ -1,5 +1,6 @@
 from abc import ABCMeta
 from random import Random
+from typing import List
 
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel, StableDiffusionXLModelEmbedding
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
@@ -26,8 +27,60 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 from torch import Tensor
 
-from diffusers.models.attention_processor import AttnProcessor, AttnProcessor2_0, XFormersAttnProcessor
+from diffusers.models.attention_processor import AttnProcessor, AttnProcessor2_0, XFormersAttnProcessor, Attention
 from diffusers.utils import is_xformers_available
+
+
+class AttentionMapLogger:
+    def __init__(self):
+        self.attention_maps: List[torch.Tensor] = []
+
+    def __call__(self, attn_probs: torch.Tensor):
+        """Recebe os mapas de atenção e os armazena."""
+        # Armazena a média dos heads, em CPU, para não estourar a VRAM.
+        self.attention_maps.append(attn_probs.detach().mean(1).cpu())
+
+    def clear(self):
+        self.attention_maps.clear()
+
+    def get_maps(self) -> List[torch.Tensor]:
+        return self.attention_maps
+
+class CapturingAttnProcessor:
+    def __init__(self, logger: AttentionMapLogger):
+        self.logger = logger
+
+    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
+        # Esta é a implementação do "caminho lento". É o preço a pagar.
+        batch_size, sequence_length, _ = hidden_states.shape
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        query = attn.to_q(hidden_states)
+
+        encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        # Cálculo manual da atenção para obter os `attention_probs`.
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+
+        # Apenas armazena os mapas durante passos de treino (onde há gradiente).
+        if attention_probs.requires_grad:
+            self.logger(attention_probs)
+
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # Projeção de saída.
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        return hidden_states
+
 
 
 class BaseStableDiffusionXLSetup(
