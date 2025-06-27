@@ -44,7 +44,6 @@ from PIL.Image import Image
 from tqdm import tqdm
 
 from modules.sangoi.TokenGradientAnalyzer import TokenGradientAnalyzer
-from modules.sangoi.ProbeScheduler import ProbeScheduler
 
 
 class GenericTrainer(BaseTrainer):
@@ -105,7 +104,6 @@ class GenericTrainer(BaseTrainer):
 
         self._steps_per_epoch = None
         self.token_analyzer = None
-        self.probe_scheduler = None
 
     def _handle_pause_logic(self):
         """Executa a lógica de pausa, movendo o modelo e esperando."""
@@ -244,22 +242,13 @@ class GenericTrainer(BaseTrainer):
         self.model_setup.setup_train_device(self.model, self.config)
         self.model_setup.setup_model(self.model, self.config)
 
-        print("Ativando Token Gradient Analyzer e Probe Scheduler.")
+        print("Ativando Token Gradient Analyzer.")
         self.token_analyzer = TokenGradientAnalyzer(
             tokenizer_l=self.model.tokenizer_1,
             tokenizer_g=self.model.tokenizer_2,
             out_dir=os.path.join(self.config.workspace_dir, "token_affinity_reports")
         )
         self.token_analyzer.start_analysis_hooks(self.model)
-
-        if self.config.enable_probe_scheduler:
-          self.probe_scheduler = ProbeScheduler(
-            tokenizer_l=self.model.tokenizer_1,
-            tokenizer_g=self.model.tokenizer_2,
-            token_analyzer=self.token_analyzer,
-            probe_interval=self.config.probe_interval,
-            probe_batch_size=self.config.probe_batch_size,
-          )
 
         self.model.eval()
         torch_gc()
@@ -890,9 +879,9 @@ class GenericTrainer(BaseTrainer):
 
                     self.token_analyzer.set_pending_analysis(train_progress.global_step, batch)
 
-                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
-
+                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)                    
                     loss = loss / self.config.gradient_accumulation_steps
+                    
                     if scaler:
                         scaler.scale(loss).backward()
                     else:

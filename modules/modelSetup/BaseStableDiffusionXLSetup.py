@@ -310,6 +310,7 @@ class BaseStableDiffusionXLSetup(
             is_align_prop_step = config.align_prop and (rand.random() < config.align_prop_probability)
 
             vae_scaling_factor = model.vae.config['scaling_factor']
+
             text_encoder_output, pooled_text_encoder_2_output = model.encode_text(
                 train_device=self.train_device,
                 batch_size=batch['latent_image'].shape[0],
@@ -318,12 +319,16 @@ class BaseStableDiffusionXLSetup(
                 tokens_2=batch['tokens_2'],
                 text_encoder_1_layer_skip=config.text_encoder_layer_skip,
                 text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
-                text_encoder_1_output=batch['text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
-                text_encoder_2_output=batch['text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
-                pooled_text_encoder_2_output=batch['text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
+                text_encoder_1_output=batch[
+                    'text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
+                text_encoder_2_output=batch[
+                    'text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
+                pooled_text_encoder_2_output=batch[
+                    'text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
                 text_encoder_1_dropout_probability=config.text_encoder.dropout_probability,
                 text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability,
             )
+
             latent_image = batch['latent_image']
             scaled_latent_image = latent_image * vae_scaling_factor
 
@@ -506,52 +511,14 @@ class BaseStableDiffusionXLSetup(
                     added_cond_kwargs=added_cond_kwargs,
                 ).sample
 
-                noise_pred_uncond = None
-                uncond_text_encoder_output, uncond_pooled_text_encoder_output = model.encode_text(
-                    train_device=self.train_device,
-                    batch_size=batch['latent_image'].shape[0],
-                    rand=rand,
-                    text="",
-                )
-                uncond_text_encoder_output = uncond_text_encoder_output.expand(latent_input.shape[0], -1, -1)
-                uncond_pooled_text_encoder_output = uncond_pooled_text_encoder_output.expand(latent_input.shape[0], -1)
-
-                # 2. CONCATENE OS INPUTS PRINCIPAIS.
-                latent_input_cfg = torch.cat([latent_input] * 2)
-                timestep_cfg = torch.cat([timestep] * 2)
-
-                # ESTA É A VARIÁVEL CORRETA PARA `encoder_hidden_states`
-                text_embeds_cfg = torch.cat([uncond_text_encoder_output, text_encoder_output])
-
-                # 3. PREPARE OS KWARGS ADICIONAIS.
-                pooled_embeds_cfg = torch.cat([uncond_pooled_text_encoder_output, pooled_text_encoder_2_output])
-                time_ids_cfg = torch.cat([add_time_ids] * 2)
-
-                added_cond_kwargs_cfg = {
-                    "text_embeds": pooled_embeds_cfg,
-                    "time_ids": time_ids_cfg
-                }
-
-                # 4. FAÇA A ÚNICA CHAMADA À UNET com os dados corretos nos lugares corretos.
-                noise_pred_cfg = model.unet(
-                    sample=latent_input_cfg.to(dtype=model.train_dtype.torch_dtype()),
-                    timestep=timestep_cfg,
-                    encoder_hidden_states=text_embeds_cfg.to(dtype=model.train_dtype.torch_dtype()), # <-- USA A VARIÁVEL CORRETA
-                    added_cond_kwargs=added_cond_kwargs_cfg,
-                ).sample
-
-                # 5. SEPARE AS PREVISÕES.
-                noise_pred_uncond, predicted_latent_noise = noise_pred_cfg.chunk(2)
-
                 model_output_data = {}
 
                 if model.noise_scheduler.config.prediction_type == 'epsilon':
                     model_output_data = {
                         'loss_type': 'target',
-                        'timestep': timestep, # Use o timestep original, não o duplicado
+                        'timestep': timestep,
                         'predicted': predicted_latent_noise,
                         'target': latent_noise,
-                        'predicted_uncond': noise_pred_uncond,
                     }
                 elif model.noise_scheduler.config.prediction_type == 'v_prediction':
                     target_velocity = model.noise_scheduler.get_velocity(scaled_latent_image, latent_noise, timestep)
@@ -560,7 +527,6 @@ class BaseStableDiffusionXLSetup(
                         'timestep': timestep,
                         'predicted': predicted_latent_noise,
                         'target': target_velocity,
-                        'predicted_uncond': noise_pred_uncond,
                     }
 
             if config.debug_mode:
@@ -658,7 +624,7 @@ class BaseStableDiffusionXLSetup(
             progress: TrainProgress,
             tensorboard: SummaryWriter
     ) -> Tensor:
-        losses, loss_uncond = self._diffusion_losses(
+        losses = self._diffusion_losses(
             batch=batch,
             data=data,
             config=config,
@@ -667,6 +633,3 @@ class BaseStableDiffusionXLSetup(
             train_device=self.train_device,
             betas=model.noise_scheduler.betas.to(device=self.train_device),
         )
-
-        # Retornamos a perda principal para o otimizador, e a de diagnóstico para nosso hack.
-        return losses.mean(), loss_uncond
