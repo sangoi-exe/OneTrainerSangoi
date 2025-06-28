@@ -619,4 +619,4 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         case LossWeight.SIGMA:
           losses *= self.__sigma_loss_weight(data["timestep"], losses.device)
 
-    return losses, None
+    return losses

@@ -624,7 +624,7 @@ class BaseStableDiffusionXLSetup(
             progress: TrainProgress,
             tensorboard: SummaryWriter
     ) -> Tensor:
-        losses = self._diffusion_losses(
+        return self._diffusion_losses(
             batch=batch,
             data=data,
             config=config,

@@ -9,8 +9,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from typing import Dict, Any, List, Optional, Tuple, Union
 from collections import defaultdict
+from modules.util.time_util import get_string_timestamp
+from typing import Dict, Any, List, Optional, Tuple, Union
 
 from diffusers.models.attention_processor import Attention
 from modules.modelSetup.BaseStableDiffusionXLSetup import AttentionMapLogger, CapturingAttnProcessor
@@ -74,6 +75,12 @@ class TokenGradientAnalyzer:
         # Scores de Tags (baseado em gradiente)
         self.tag_ema_scores: Dict[str, float] = {}
         self.tag_all_scores_history: Dict[str, List[float]] = defaultdict(list)
+        
+        base_out_dir = pathlib.Path(out_dir)
+        timestamp = get_string_timestamp(style='file') # Ex: '20250622_143055'
+        self.out_dir = base_out_dir / timestamp
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[TokenAnalyzer] Relatórios serão salvos em: {self.out_dir}")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[TokenAnalyzer] Inicializado. Device: {self.device}")
@@ -430,6 +437,7 @@ class TokenGradientAnalyzer:
         
         fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.5, rows * 2.5), dpi=120)
         fig.suptitle(f'Attention Heatmaps ({output_suffix}) - Step {step}', fontsize=20)
+        
 
         # Garante que `axes` seja sempre um array para fácil iteração
         if num_tokens_to_plot <= 1:
@@ -451,7 +459,8 @@ class TokenGradientAnalyzer:
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         
         # 5. Salva como JPEG
-        outfile = self.out_dir / f"step_{step:06d}_{image_tag}_HEATMAP_{output_suffix}.jpg"
+
+        outfile = self.out_dir / f"{image_tag}_HEATMAP_step_{step:06d}_{output_suffix}.jpg"
         plt.savefig(outfile, format='jpeg', dpi=96, pil_kwargs={'quality': 80})
         plt.close(fig)
         #print(f"[TokenAnalyzer] Heatmap ({output_suffix}) salvo em: {outfile}")
