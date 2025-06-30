@@ -97,7 +97,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
       data: dict,
       config: TrainConfig,
   ):
-    
+    #attention_entropy = self.token_analyzer.get_current_attention_entropy()
     progress = self.progress
     losses = 0
 
@@ -209,7 +209,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
       data: dict,
       config: TrainConfig,
   ):
-    
+    #attention_entropy = self.token_analyzer.get_current_attention_entropy()
     progress = self.progress
     losses = 0
 

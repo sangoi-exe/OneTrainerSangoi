@@ -246,7 +246,8 @@ class GenericTrainer(BaseTrainer):
         self.token_analyzer = TokenGradientAnalyzer(
             tokenizer_l=self.model.tokenizer_1,
             tokenizer_g=self.model.tokenizer_2,
-            out_dir=os.path.join(self.config.workspace_dir, "token_affinity_reports")
+            out_dir=os.path.join(self.config.workspace_dir, "token_affinity_reports"),
+            config=self.config
         )
         self.token_analyzer.start_analysis_hooks(self.model)
 
@@ -294,7 +295,7 @@ class GenericTrainer(BaseTrainer):
         if os.path.exists(backup_dirpath):
             backup_directories = sorted(
                 [dirpath for dirpath in os.listdir(backup_dirpath) if
-                 os.path.isdir(os.path.join(backup_dirpath, dirpath))],
+                os.path.isdir(os.path.join(backup_dirpath, dirpath))],
                 reverse=True,
             )
 
@@ -744,19 +745,8 @@ class GenericTrainer(BaseTrainer):
 
     def train(self):
         train_device = torch.device(self.config.train_device)
-
         train_progress = self.model.train_progress
-        # Garante que os gradientes dos embeddings de token estejam ativados para a análise
-        if self.token_analyzer:
-          print("[GenericTrainer] Ativando requires_grad para embeddings (análise de token)..")
-          emb_layer_l = self.model.text_encoder_1.get_input_embeddings()
-          if not emb_layer_l.weight.requires_grad:
-            emb_layer_l.weight.requires_grad_(True)
-          
-          emb_layer_g = self.model.text_encoder_2.get_input_embeddings()
-          if not emb_layer_g.weight.requires_grad:
-            emb_layer_g.weight.requires_grad_(True)
-
+        
         if self.config.only_cache:
             self.callbacks.on_update_status("caching")
             for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
@@ -818,6 +808,17 @@ class GenericTrainer(BaseTrainer):
 
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
             step_tqdm = tqdm(self.data_loader.get_data_loader(), desc="step", total=current_epoch_length, initial=train_progress.epoch_step)
+
+
+            # else:
+            #     print("[GenericTrainer] Ativando requires_grad para embeddings (análise de token)..")
+            #     emb_layer_l = self.model.text_encoder_1.get_input_embeddings()
+            #     if not emb_layer_l.weight.requires_grad:
+            #       emb_layer_l.weight.requires_grad_(True)
+                
+            #     emb_layer_g = self.model.text_encoder_2.get_input_embeddings()
+            #     if not emb_layer_g.weight.requires_grad:
+            #       emb_layer_g.weight.requires_grad_(True)
             
             train_progress.set_steps_per_epoch(self.data_loader.get_data_set().approximate_length())
             self._steps_per_epoch = train_progress.steps_per_epoch
@@ -867,27 +868,52 @@ class GenericTrainer(BaseTrainer):
 
                 self.callbacks.on_update_status("training")
 
+                # 1. ATIVAÇÃO DE GRADIENTE PARA O MODO CACHE (Custo insignificante)
+                if self.token_analyzer and not self.config.train_text_encoder_or_embedding():
+                    
+                    hidden_states_l = batch.get('text_encoder_1_hidden_state')
+                    if hidden_states_l is not None:
+                        hidden_states_l.requires_grad_(True)
+                    
+                    hidden_states_g = batch.get('text_encoder_2_hidden_state')
+                    if hidden_states_g is not None:
+                        hidden_states_g.requires_grad_(True)
+                    
+                    pooled_output_g = batch.get('text_encoder_2_pooled_state')
+                    if pooled_output_g is not None:
+                        pooled_output_g.requires_grad_(True)
+
                 with TorchMemoryRecorder(enabled=False):
+                    # Prepara o analisador para a coleta de dados
+                    if self.token_analyzer:
+                        self.token_analyzer.set_pending_analysis(train_progress.global_step, batch)
+                        # Instala os hooks de atenção se for um passo de análise de atenção
+                        if self.token_analyzer.enable_attn_report:
+                            self.token_analyzer.start_analysis_hooks(self.model)
+
+                    # 2. FORWARD PASS
                     model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
                     
-                    predicted = model_output_data["predicted"] # bf16/fp16
-
-                    if self.config.masked_training:
-                        mask_bf16 = self.prepare_mask(batch["latent_mask"], predicted)
-                        # Hook que zera gradiente fora da máscara
-                        self.stop_grad_outside_mask(predicted, mask_bf16) # função global ou estática
-
-                    self.token_analyzer.set_pending_analysis(train_progress.global_step, batch)
-
-                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)                    
+                    # 3. BACKWARD PASS
                     loss = loss / self.config.gradient_accumulation_steps
-                    
-                    if scaler:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                    loss.backward()
 
-                    self.token_analyzer.analyze_and_save_report(self.model)
+                    # 4. ANÁLISE DE GRADIENTE (O PONTO CRÍTICO)
+                    # DEPOIS do backward, ANTES do step/zero_grad.
+                    if self.token_analyzer:
+                        self.token_analyzer.analyze_gradients_after_backward(self.model)
+
+                    # 5. ATUALIZAÇÃO DOS PESOS
+                    self.model.optimizer.step()
+                    self.model.optimizer.zero_grad(set_to_none=True)
+
+                    # 6. ANÁLISE DE ATENÇÃO E LIMPEZA (Final do passo)
+                    if self.token_analyzer:
+                        self.token_analyzer.analyze_attention_after_step(self.model, train_progress.epoch)
+                        # Desinstala os hooks de atenção
+                        if self.token_analyzer.enable_attn_report:
+                            self.token_analyzer.stop_analysis_hooks(self.model)
 
                     has_gradient = True
                     accumulated_loss += loss.item()
@@ -987,7 +1013,6 @@ class GenericTrainer(BaseTrainer):
 
             if self.model.ema:
                 self.model.ema.copy_ema_to(self.parameters, store_temp=False)
-
 
             # toma bem no meio do cu do nerogar, tem função de save até dentro do rabo dele
             # aí tive que fazer uma gambiarra aqui pra evitar que um safetensor seja sobrescrito

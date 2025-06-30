@@ -253,6 +253,9 @@ class TrainConfig(BaseConfig):
     parameters_by_module: bool
     param_group_strategy: str # module | block | stage | type | stage_type | block_type
     enable_token_grad_analyzer: bool
+    analyzer_enable_grad_report: bool
+    analyzer_enable_attn_report: bool
+    analyzer_heatmap_interval: int
 
     loss_tracker_window: int
     loss_tracker_use_mad: bool
@@ -747,24 +750,21 @@ class TrainConfig(BaseConfig):
         
         # sangoi settings
         data.append(("parameters_by_module", False, bool, False))
-        data.append(("enable_token_grad_analyzer", False, bool, False))
-        data.append(("token_analyzer_log_interval", 10, int, False))
-        data.append(("token_analyzer_top_k", 10, int, False))
         data.append(("enable_probe_scheduler", True, bool, False))
-        data.append(("probe_interval", 10, int, False))
-        data.append(("probe_batch_size", 8, int, False))
         data.append(("param_group_strategy", "module", str, False))
         data.append(("loss_tracker_window", 100, int, False))
         data.append(("loss_tracker_use_mad", False, bool, False))
         data.append(("dls_use_ema", False, bool, False))
         data.append(("dls_ema_decay", 0.9, float, False))
         data.append(("dls_outlier_threshold", 3.0, float, False))
-        data.append(("huber_strength", 0.0, float, False))
-        data.append(("charbonier_strength", 0.0, float, False))
         data.append(("dyloco_params", [], list[DyLoCoConfig], True))
         data.append(("lora_generate_keys_file", False, bool, False))
         data.append(("lora_module_overrides", "", str, False))
         data.append(("bucket_ratio", 64, int, False))
+        data.append(("enable_token_grad_analyzer", True, bool, False))
+        data.append(("analyzer_enable_grad_report", False, bool, False))
+        data.append(("analyzer_enable_attn_report", False, bool, False))
+        data.append(("analyzer_heatmap_interval", 1, int, False)) # 1 = a cada epoch
 
         # model settings
         data.append(("base_model_name", "stable-diffusion-v1-5/stable-diffusion-v1-5", str, False))

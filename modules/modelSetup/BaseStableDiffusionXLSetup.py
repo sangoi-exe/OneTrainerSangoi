@@ -24,8 +24,11 @@ from modules.util.quantization_util import quantize_layers
 from modules.util.TrainProgress import TrainProgress
 from torch.utils.tensorboard import SummaryWriter
 
+import math
 import torch
+import torch.nn.functional as F
 from torch import Tensor
+
 
 from diffusers.models.attention_processor import AttnProcessor, AttnProcessor2_0, XFormersAttnProcessor, Attention
 from diffusers.utils import is_xformers_available
@@ -102,8 +105,7 @@ class CapturingAttnProcessor:
             traceback.print_exc()
             print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             # Lança o erro de novo para não quebrar o fluxo de execução de forma silenciosa
-            raise e    
-
+            raise e
 
 
 class BaseStableDiffusionXLSetup(
@@ -319,12 +321,9 @@ class BaseStableDiffusionXLSetup(
                 tokens_2=batch['tokens_2'],
                 text_encoder_1_layer_skip=config.text_encoder_layer_skip,
                 text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
-                text_encoder_1_output=batch[
-                    'text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
-                text_encoder_2_output=batch[
-                    'text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
-                pooled_text_encoder_2_output=batch[
-                    'text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
+                text_encoder_1_output=batch['text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
+                text_encoder_2_output=batch['text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
+                pooled_text_encoder_2_output=batch['text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
                 text_encoder_1_dropout_probability=config.text_encoder.dropout_probability,
                 text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability,
             )

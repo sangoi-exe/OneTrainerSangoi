@@ -6,6 +6,7 @@ import numpy as np
 import torch.nn.functional as F
 
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
@@ -25,6 +26,7 @@ class TokenGradientAnalyzer:
 
     def __init__(
         self,
+        config,
         tokenizer_l,
         tokenizer_g,
         top_k_tokens: int = 5000,
@@ -39,6 +41,11 @@ class TokenGradientAnalyzer:
         if not (0 < ema_beta < 1):
             raise ValueError("ema_beta deve estar entre 0 e 1")
 
+        self.config = config
+        self.enable_grad_report = config.analyzer_enable_grad_report
+        self.enable_attn_report = config.analyzer_enable_attn_report
+        self.heatmap_interval = config.analyzer_heatmap_interval
+
         # --- Configurações Gerais (Mantidas) ---
         self.tokenizer_l = tokenizer_l
         self.tokenizer_g = tokenizer_g
@@ -51,6 +58,9 @@ class TokenGradientAnalyzer:
         self._tags_text_list: List[str] = []
         self._tag_embeddings_matrix: Optional[torch.Tensor] = None
 
+        # instância capturing
+        self.capturing_processor = None
+
         # --- Estado da Análise de Gradiente ---
         self._grad_hook_handles: List[torch.utils.hooks.RemovableHandle] = []
         self._grad_l: Optional[torch.Tensor] = None
@@ -58,6 +68,7 @@ class TokenGradientAnalyzer:
 
         # --- Estado da Análise de Atenção (A FORMA CORRETA) ---
         self.map_logger = AttentionMapLogger()
+        self.capturing_processor = CapturingAttnProcessor(logger=self.map_logger)
         self._original_attn_processors: Dict[str, Any] = {}
         self.is_capturing_attention = False
 
@@ -91,51 +102,41 @@ class TokenGradientAnalyzer:
     def _backward_hook_g(self, module, grad_input, grad_output):
         if grad_output[0] is not None: self._grad_g = grad_output[0].detach()
 
-    def start_analysis_hooks(self, model: torch.nn.Module):
+    def get_penalties(self, current_epoch: int) -> torch.Tensor:
         """
-        Prepara o modelo para uma rodada de análise.
-        1. Registra hooks de gradiente.
-        2. Substitui os processadores de atenção para iniciar a captura.
+        Obtém a soma de penalidades calculadas durante o forward atual
+        e reseta o buffer do CapturingAttnProcessor para o próximo passo.
+
+        Parâmetros
+        ----------
+        current_epoch : int
+            Época em que o forward foi executado. Mantém o contador interno
+            do processor em sincronia (importante para warm-up).
+
+        Retorna
+        -------
+        torch.Tensor
+            Um escalar com gradiente contendo a penalidade total.
+            (Zero se não houve captura ou se ainda está no warm-up.)
         """
-        if model is None:
-            print("[TokenAnalyzer] Modelo None. Análise não pode ser iniciada.")
+        pen = self.global_penalty.clone()      # usa o valor acumulado
+        self.global_penalty.zero_()            # limpa pro próximo passo
+        return pen
+    
+    def set_capture_mode(self, capture: bool):
+        """Liga ou desliga a captura em nossa instância de processador."""
+        self.capturing_processor.set_capture_mode(capture)
+
+    def start_analysis_hooks(self, model):
+        if self.is_capturing_attention:   # evita dupla instalação
             return
 
-        # 1. Hooks de Gradiente
-        self._grad_hook_handles.clear()
-        try:
-            self._grad_hook_handles.append(
-                model.text_encoder_1.text_model.embeddings.register_full_backward_hook(self._backward_hook_l)
-            )
-            self._grad_hook_handles.append(
-                model.text_encoder_2.text_model.embeddings.register_full_backward_hook(self._backward_hook_g)
-            )
-        except AttributeError as e:
-            print(f"[TokenAnalyzer] Erro registrando hooks de gradiente: {e}")
+        self._original_attn_processors = model.unet.attn_processors.copy()
 
-        # 2. Captura de Atenção via substituição de processador
-        if not self.is_capturing_attention:
-            print("[TokenAnalyzer] Iniciando captura de atenção...")
-            
-            # Salva os processadores originais para restauração, como antes.
-            self._original_attn_processors = model.unet.attn_processors.copy()
-            
-            capturing_processor = CapturingAttnProcessor(self.map_logger)
-            
-            attn_module_names_to_capture = [
-                name for name, module in model.unet.named_modules() 
-                if isinstance(module, Attention) and "attn2" in name
-            ]
+        attn_module_names = [name for name, module in model.unet.named_modules() if isinstance(module, Attention) and "attn2" in name]
 
-            if not attn_module_names_to_capture:
-                print("[AVISO] Nenhum módulo de cross-attention ('attn2') encontrado para substituição.")
-                return
-
-            # AGORA VOCÊ ITERA SOBRE A LISTA CORRETA.
-            for name in attn_module_names_to_capture:
-                model.unet.set_processor(name, capturing_processor)
-            
-            self.is_capturing_attention = True
+        for name in attn_module_names:
+            model.unet.set_processor(name, self.capturing_processor)
 
     def stop_analysis_hooks(self, model: torch.nn.Module):
         """Limpa tudo e restaura o modelo ao seu estado original."""
@@ -159,22 +160,31 @@ class TokenGradientAnalyzer:
         self.map_logger.clear() # Limpa mapas da iteração anterior
         self.pending_data = {"step": step, "batch": batch}
 
-    def analyze_and_save_report(self, model: torch.nn.Module):
+    def analyze_and_save_report(self, model: torch.nn.Module, current_epoch: int):
         step = self.pending_data.get("step", -1)
         batch = self.pending_data.get("batch", {})
-
+        
         try:
-            # Análise de Gradiente (sua lógica original, intocada)
-            if self._grad_l is not None and self._grad_g is not None:
-                grad_l_full, grad_g_full = -self._grad_l, -self._grad_g
-                with torch.no_grad():
-                    self._analyze_tokens_from_gradient(model, grad_l_full, grad_g_full, step, batch)
-            else:
-                print(f"[TokenAnalyzer] Gradientes não capturados no step {step}.")
-
-            # Análise de Atenção (agora consome do logger)
-            self._analyze_tokens_from_attention(step, batch)
-            self._visualize_attention_heatmaps(step, batch)
+            # --- Roteamento para Análise de Gradiente ---
+            if self.enable_grad_report:
+                if self._grad_l is not None and self._grad_g is not None:
+                    grad_l_full, grad_g_full = -self._grad_l, -self._grad_g
+                    with torch.no_grad():
+                        self._analyze_tokens_from_gradient(model, grad_l_full, grad_g_full, step, batch)
+                else:
+                    print(f"[TokenAnalyzer] Gradientes não capturados no step {step} (relatório de gradiente pulado).")
+                    
+            if self.enable_attn_report:
+                self._analyze_tokens_from_attention(step, batch)
+                
+            # --- Roteamento para Heatmaps (com lógica de intervalo) ---
+            # A condição verifica se o intervalo é válido (maior que 0)
+            # e se a epoch atual é um múltiplo do intervalo.
+            # A condição `current_epoch == 0` garante que a primeira epoch SEMPRE gere o heatmap.
+            should_generate_heatmap = self.heatmap_interval > 0 and (current_epoch % self.heatmap_interval == 0 or current_epoch == 0)
+            
+            if should_generate_heatmap:
+                self._visualize_attention_heatmaps(step, batch)                
 
         except Exception as e:
             import traceback
@@ -184,23 +194,106 @@ class TokenGradientAnalyzer:
             self._grad_l, self._grad_g = None, None
             self.pending_data.clear()
 
-    def _analyze_tokens_from_gradient(self, model, grad_l, grad_g, step, batch):
-        device = grad_g.device
-        emb_l = model.text_encoder_1.get_input_embeddings().weight.to(device)
-        emb_g = model.text_encoder_2.get_input_embeddings().weight.to(device)
+    def analyze_gradients_after_backward(self, model: torch.nn.Module):
+        """
+        Chamada IMEDIATAMENTE após loss.backward().
+        Analisa os gradientes antes que eles sejam zerados.
+        """
+        if not self.enable_grad_report:
+            return
 
-        vec_l = grad_l.mean(dim=(0, 1))
-        vec_g = grad_g.mean(dim=(0, 1))
+        step = self.pending_data.get("step", -1)
+        batch = self.pending_data.get("batch", {})
+        if not batch: return
 
-        affinity_l = torch.matmul(emb_l, vec_l)
-        affinity_g = torch.matmul(emb_g, vec_g)
+        try:
+            # A função unificada que já criamos.
+            self._analyze_tokens_from_gradient(model, step, batch)
+        except Exception as e:
+            print(f"[TokenAnalyzer] ERRO ao analisar gradientes (Step {step}): {e}")
+            import traceback
+            traceback.print_exc()
 
-        grad_scores = affinity_g if affinity_l.shape != affinity_g.shape else affinity_l + affinity_g
-        if affinity_l.shape != affinity_g.shape:
-            print(f"[TokenAnalyzer] AVISO (Step {step}): vocab L≠G, usando só G.")
+    def analyze_attention_after_step(self, model: torch.nn.Module, current_epoch: int):
+        """
+        Chamada no final do passo.
+        Gera relatórios de atenção e heatmaps a partir dos dados coletados no forward pass.
+        """
+        step = self.pending_data.get("step", -1)
+        batch = self.pending_data.get("batch", {})
+        if not batch: return
 
-        self._update_all_score_metrics(grad_scores, is_token=True, use_attention_scores=False)
-        self._save_report(step, batch, grad_scores, "Gradient Tokens", self.grad_token_ema_scores)
+        try:
+            # Análise de Atenção para scores
+            if self.enable_attn_report:
+                self._analyze_tokens_from_attention(step, batch)
+            
+            # Geração de Heatmaps em intervalos
+            should_generate_heatmap = self.heatmap_interval > 0 and (current_epoch % self.heatmap_interval == 0)
+            if should_generate_heatmap:
+                self._visualize_attention_heatmaps(step, batch)
+        except Exception as e:
+            print(f"[TokenAnalyzer] ERRO ao analisar atenção/heatmaps (Step {step}): {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Limpa o estado para o próximo passo
+            self._grad_l, self._grad_g = None, None
+            self.pending_data.clear()
+            self.map_logger.clear()
+
+    def _analyze_tokens_from_gradient(self, model, step: int, batch: Dict[str, Any]):
+        """
+        Função unificada que analisa a atribuição de gradiente, funcionando tanto
+        com hooks (quando o TE está treinando) quanto com embeddings cacheadados.
+        """
+        grad_l, grad_g = None, None
+
+        # --- ETAPA 1: OBTENÇÃO DOS DADOS DE GRADIENTE ---
+        # A função agora é responsável por encontrar sua própria fonte de dados.
+
+        if self.config.train_text_encoder_or_embedding():
+            # MODO 1: TE está treinando. Os gradientes vêm dos hooks.
+            if self._grad_l is not None and self._grad_g is not None:
+                grad_l = self._grad_l
+                grad_g = self._grad_g
+            else:
+                print(f"[TokenAnalyzer] Gradientes dos hooks não capturados no step {step}.")
+                return
+        else:
+            # MODO 2: TE não está treinando. Os gradientes vêm dos tensores cacheados.
+            cached_hidden_states_l = batch.get('text_encoder_1_hidden_state')
+            cached_hidden_states_g = batch.get('text_encoder_2_hidden_state')
+
+            if cached_hidden_states_g is not None and cached_hidden_states_g.grad is not None:
+                grad_g = cached_hidden_states_g.grad
+            
+            if cached_hidden_states_l is not None and cached_hidden_states_l.grad is not None:
+                grad_l = cached_hidden_states_l.grad
+            
+            if grad_g is None: # O gradiente do CLIP-G é o mais importante
+                print(f"[TokenAnalyzer] Gradientes dos embeddings cacheadados não encontrados no step {step}.")
+                return
+
+        # --- ETAPA 2: CÁLCULO DOS SCORES (Lógica que você já tinha) ---
+        # Esta parte agora funciona com gradientes de qualquer uma das fontes.
+
+        # Calcula a norma L2 para cada token.
+        scores_g = -grad_g.norm(p=2, dim=-1) # Shape: (B, 77)
+
+        # Lida com o caso de não ter o gradiente do CLIP-L
+        if grad_l is not None:
+            scores_l = -grad_l.norm(p=2, dim=-1)
+            # Faz a média no batch e combina
+            grad_scores = (scores_g.mean(dim=0) + scores_l.mean(dim=0)) / 2
+        else:
+            # Usa apenas os scores do CLIP-G
+            grad_scores = scores_g.mean(dim=0)
+
+        # --- ETAPA 3: GERAÇÃO DO RELATÓRIO ---
+        self._save_prompt_based_report(
+            step, batch, grad_scores, "Gradient_Attribution", self.grad_token_ema_scores
+        )
 
     def _analyze_tokens_from_attention(self, step: int, batch: Dict[str, Any]):
         """
@@ -247,17 +340,57 @@ class TokenGradientAnalyzer:
             total_scores = torch.stack(layer_scores).sum(dim=0)
             
             # VERIFICAÇÃO DE SANIDADE para evitar o erro de len()
-            if total_scores.ndim == 0: # Se for um escalar
-                print("[AVISO] Scores de atenção agregados resultaram em um escalar. Pulando análise.")
-                return
+            if total_scores.ndim == 0: return
 
-            self._update_all_score_metrics(total_scores, is_token=True, use_attention_scores=True)
-            self._save_report(step, batch, total_scores, "Attention_Scores", self.attn_token_ema_scores)
+            # O `total_scores` é um vetor de 77 scores. Chame a nova função de relatório.
+            self._save_prompt_based_report(
+                step, batch, total_scores, "Attention_Attribution", self.attn_token_ema_scores
+            )
 
         except Exception as e:
             print(f"[TokenAnalyzer] ERRO ao analisar scores de atenção: {e}")
             import traceback
             traceback.print_exc()
+
+    def _save_prompt_based_report(self, step: int, batch: Dict[str, Any], scores: torch.Tensor, report_type: str, ema_scores: Dict):
+        """
+        Salva um relatório onde os scores correspondem aos tokens no prompt atual.
+        """
+        report_header, image_tag = self._get_common_report_header(step, batch, report_type)
+        
+        # Usa o tokenizer do CLIP-G (tokens_2) como referência para os nomes.
+        token_ids = batch['tokens_2'][0]
+        tokens_text = [self.tokenizer_g.decode(tid) for tid in token_ids]
+
+        # Combina os tokens e seus scores
+        scored_tokens = []
+        for i in range(len(scores)):
+            token_id = token_ids[i].item()
+            token_text = tokens_text[i].replace('</w>', '').strip()
+            score = scores[i].item()
+            
+            # Ignora tokens de padding/controle no relatório
+            if token_text in [self.tokenizer_g.eos_token, self.tokenizer_g.pad_token, self.tokenizer_g.bos_token]:
+                continue
+            
+            scored_tokens.append({'text': token_text, 'id': token_id, 'score': score})
+
+        # Ordena os tokens do prompt pelo score
+        sorted_tokens = sorted(scored_tokens, key=lambda x: x['score'], reverse=True)
+
+        # Monta o relatório
+        report_lines = list(report_header)
+        report_lines.append("--- Importância de Tokens no Prompt (Score Atual) ---\n")
+        report_lines.append("Score      | Token (ID)\n")
+        report_lines.append("-----------|----------------------------------\n")
+        
+        for item in sorted_tokens:
+            report_lines.append(f"{item['score']:<10.6f} | {item['text']} (ID: {item['id']})\n")
+
+        # Salva o arquivo
+        safe_report_type = report_type.replace(" ", "_")
+        outfile = self.out_dir / f"{image_tag}_step_{step:06d}_{safe_report_type}.txt"
+        outfile.write_text("".join(report_lines), encoding="utf-8", errors="ignore")
 
     def _update_all_score_metrics(self, current_scores: torch.Tensor, is_token: bool, use_attention_scores: bool = False, item_list_for_keys: Optional[List[str]] = None):
         if is_token:
@@ -274,10 +407,6 @@ class TokenGradientAnalyzer:
             # Sua "EMA" que é uma soma. Mantive, mas saiba que está errado.
             ema_dict[key] = ema_dict.get(key, 0.0) + score_val
             history_dict[key].append(score_val)
-
-    # ========================================================================= #
-    # MÉTODOS DE RELATÓRIO E UTILITÁRIOS (Refatorados para clareza)
-    # ========================================================================= #
 
     def _save_report(self, step: int, batch: Dict[str, Any], current_scores: torch.Tensor, report_type: str, ema_scores: Dict):
         """Função unificada para salvar relatórios de step."""
@@ -366,7 +495,6 @@ class TokenGradientAnalyzer:
             return
 
         try:
-            # --- ETAPA DE AGREGAÇÃO (como antes, mas agora é reutilizada) ---
             base_batch_size = batch['tokens_1'].shape[0]
             conditional_maps = [m[:base_batch_size] for m in attn_maps_raw]
 
@@ -496,4 +624,32 @@ class TokenGradientAnalyzer:
                     min_ratio_diff = diff2
                     best_h, best_w = w, h
         
-        return best_h, best_w            
+        return best_h, best_w
+
+    def get_current_attention_entropy(self) -> float | None:
+        """
+        Calcula e retorna a entropia média das camadas de atenção capturadas.
+        Esta função consome os mapas, então só pode ser chamada uma vez por passo.
+        """
+        attn_maps_raw = self.map_logger.get_maps_for_heatmap() # Pega os mapas
+        self.map_logger.clear() # Limpa para o próximo passo
+
+        if not attn_maps_raw:
+            return None
+
+        base_bs = self.pending_data.get("batch", {}).get('tokens_1', torch.empty(0)).shape[0]
+        if base_bs == 0: return None
+
+        entropies_per_layer = []
+        for raw_map in attn_maps_raw:
+            p_cond = raw_map[:base_bs]
+            p_cond = torch.clamp(p_cond, min=1e-8)
+            entropy_map = -(p_cond * p_cond.log()).sum(dim=-1)
+            avg_entropy_for_layer = entropy_map.mean()
+            entropies_per_layer.append(avg_entropy_for_layer)
+
+        if not entropies_per_layer:
+            return None
+
+        # Retorna a entropia média de todas as camadas
+        return torch.stack(entropies_per_layer).mean().item()

@@ -243,5 +243,27 @@ class DynamicLossControl:
             sum_weighted = 1.0
         final_weights = {loss: weight / sum_weighted for loss, weight in weighted_weights.items()}
 
+        # # --- A MODULAÇÃO FINAL COM O VETOR-PORRETE DA ATENÇÃO ---
+        # if attention_entropy is not None:
+        #     # Normaliza a entropia para um fator entre, digamos, 0 e 2.
+        #     # (Isso requer uma média móvel da entropia para saber o que é "normal")
+        #     # Por simplicidade, vamos criar um fator de modulação direto.
+        #     # Se a entropia é alta (difusa), queremos mais MSE.
+        #     # Se a entropia é baixa (focada), queremos mais MAE.
+            
+        #     # Exemplo de lógica de modulação (precisa de calibração):
+        #     # Suponha que a entropia "normal" seja ~4.0.
+        #     entropy_factor = torch.sigmoid(torch.tensor(attention_entropy - 4.0)).item() # Varia de 0 a 1
+
+        #     # Quando a entropia é alta (fator ~1), aumenta o peso do MSE.
+        #     # Quando a entropia é baixa (fator ~0), aumenta o peso do MAE.
+        #     final_weights['mse'] *= (1 + entropy_factor) # Aumenta o MSE com entropia alta
+        #     final_weights['mae'] *= (2 - entropy_factor) # Aumenta o MAE com entropia baixa
+
+        #     # Renormaliza para garantir que a soma ainda seja 1.
+        #     sum_final = sum(final_weights.values())
+        #     if sum_final > 1e-8:
+        #         final_weights = {loss: weight / sum_final for loss, weight in final_weights.items()}
+
         # Return the final adjusted weights in the order of MSE, MAE, log-cosh
         return final_weights["mse"], final_weights["mae"], final_weights["log_cosh"]
