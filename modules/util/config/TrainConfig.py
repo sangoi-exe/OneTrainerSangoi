@@ -761,7 +761,7 @@ class TrainConfig(BaseConfig):
         data.append(("lora_generate_keys_file", False, bool, False))
         data.append(("lora_module_overrides", "", str, False))
         data.append(("bucket_ratio", 64, int, False))
-        data.append(("enable_token_grad_analyzer", True, bool, False))
+        data.append(("enable_cross_attn_maps_anal", False, bool, False))
         data.append(("analyzer_enable_grad_report", False, bool, False))
         data.append(("analyzer_enable_attn_report", False, bool, False))
         data.append(("analyzer_heatmap_interval", 1, int, False)) # 1 = a cada epoch

@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import copy
 import json
 import os
@@ -15,7 +16,6 @@ from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSampler.BaseModelSampler import BaseModelSampler
 from modules.modelSaver.BaseModelSaver import BaseModelSaver
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
-from modules.modelSetup.BaseStableDiffusionXLSetup import CapturingAttnProcessor
 from modules.sangoi.LogFun import logFun
 from modules.trainer.BaseTrainer import BaseTrainer
 from modules.util import create, path_util
@@ -43,7 +43,7 @@ from torchvision.transforms.functional import pil_to_tensor
 from PIL.Image import Image
 from tqdm import tqdm
 
-from modules.sangoi.TokenGradientAnalyzer import TokenGradientAnalyzer
+from modules.sangoi.CrossAttnMapsAnalyzer import CrossAttnMapsAnalyzer
 
 
 class GenericTrainer(BaseTrainer):
@@ -103,11 +103,11 @@ class GenericTrainer(BaseTrainer):
         self.pause_requested_at_epoch_end = False
 
         self._steps_per_epoch = None
-        self.token_analyzer = None
+        self.cross_attn_maps_anal = None
 
     def _handle_pause_logic(self):
         """Executa a lógica de pausa, movendo o modelo e esperando."""
-        if not self.is_paused:  # Segurança extra
+        if not self.is_paused:
             return
 
         logFun("Iniciando Pausa...", lvl="LOOP")
@@ -241,15 +241,15 @@ class GenericTrainer(BaseTrainer):
         self.model_setup.setup_optimizations(self.model, self.config)
         self.model_setup.setup_train_device(self.model, self.config)
         self.model_setup.setup_model(self.model, self.config)
-
-        print("Ativando Token Gradient Analyzer.")
-        self.token_analyzer = TokenGradientAnalyzer(
-            tokenizer_l=self.model.tokenizer_1,
-            tokenizer_g=self.model.tokenizer_2,
-            out_dir=os.path.join(self.config.workspace_dir, "token_affinity_reports"),
-            config=self.config
-        )
-        self.token_analyzer.start_analysis_hooks(self.model)
+        if (getattr(self.config, "enable_cross_attn_maps_anal"), False):
+            print("Ativando Token Gradient Analyzer.")
+            self.cross_attn_maps_anal = CrossAttnMapsAnalyzer(
+                config=self.config,
+                model=self.model,
+                tokenizer_l=self.model.tokenizer_1,
+                tokenizer_g=self.model.tokenizer_2,
+                out_dir=os.path.join(self.config.workspace_dir, "token_affinity_reports"),
+            )
 
         self.model.eval()
         torch_gc()
@@ -869,7 +869,7 @@ class GenericTrainer(BaseTrainer):
                 self.callbacks.on_update_status("training")
 
                 # 1. ATIVAÇÃO DE GRADIENTE PARA O MODO CACHE (Custo insignificante)
-                if self.token_analyzer and not self.config.train_text_encoder_or_embedding():
+                if self.cross_attn_maps_anal and not self.config.train_text_encoder_or_embedding():
                     
                     hidden_states_l = batch.get('text_encoder_1_hidden_state')
                     if hidden_states_l is not None:
@@ -884,36 +884,89 @@ class GenericTrainer(BaseTrainer):
                         pooled_output_g.requires_grad_(True)
 
                 with TorchMemoryRecorder(enabled=False):
-                    # Prepara o analisador para a coleta de dados
-                    if self.token_analyzer:
-                        self.token_analyzer.set_pending_analysis(train_progress.global_step, batch)
-                        # Instala os hooks de atenção se for um passo de análise de atenção
-                        if self.token_analyzer.enable_attn_report:
-                            self.token_analyzer.start_analysis_hooks(self.model)
+                    # ------------------------------------------------------------------
+                    # 1. DECIDIR SE A ANÁLISE DE ATENÇÃO ESTÁ ATIVA PARA ESTE PASSO
+                    # ------------------------------------------------------------------
+                    capture_attn_now = False
+                    if self.cross_attn_maps_anal:
+                        is_heatmap_step = self.cross_attn_maps_anal.heatmap_interval > 0 and \
+                                          (train_progress.epoch % self.cross_attn_maps_anal.heatmap_interval == 0)
+                        capture_attn_now = is_heatmap_step
 
-                    # 2. FORWARD PASS
-                    model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
-                    
-                    # 3. BACKWARD PASS
-                    loss = loss / self.config.gradient_accumulation_steps
-                    loss.backward()
+                    # ------------------------------------------------------------------
+                    # 2. PREPARAR O CONTEXTO E O ANALISADOR
+                    # ------------------------------------------------------------------
+                    if self.cross_attn_maps_anal:
+                        # Prepara o analisador, limpando o estado do passo anterior
+                        self.cross_attn_maps_anal.prepare_for_step(train_progress.global_step, batch)
+                        
+                    # O context manager só é ativado se precisarmos dos mapas de atenção.
+                    # Caso contrário, usamos um contexto nulo para máxima performance.
+                    ctx = self.cross_attn_maps_anal.cap_manager.capture_cross(self.model) \
+                        if capture_attn_now and self.cross_attn_maps_anal else nullcontext()
 
-                    # 4. ANÁLISE DE GRADIENTE (O PONTO CRÍTICO)
-                    # DEPOIS do backward, ANTES do step/zero_grad.
-                    if self.token_analyzer:
-                        self.token_analyzer.analyze_gradients_after_backward(self.model)
+                    # ------------------------------------------------------------------
+                    # 3. FORWARD + BACKWARD (DENTRO DO CONTEXTO PARA O CHECKPOINTING)
+                    # ------------------------------------------------------------------
+                    with ctx:
+                        # O forward pass que gera os dados para a perda
+                        model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                        
+                        # O cálculo da perda
+                        loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
 
+                        # PEGA OS DADOS LIMPOS DO FORWARD
+                        maps_from_forward = self.cross_attn_maps_anal.map_logger.get_maps().copy() # .copy() é crucial
+                        
+                        # LIMPA O LOGGER ANTES DO BACKWARD
+                        self.cross_attn_maps_anal.map_logger.clear()
+                        # O backward pass
+                        loss = loss / self.config.gradient_accumulation_steps
+                        loss.backward()
+
+                    # ------------------------------------------------------------------
+                    # 4. ANÁLISE DE GRADIENTE (PONTO CRÍTICO)
+                    # ------------------------------------------------------------------
+                    if self.cross_attn_maps_anal and self.cross_attn_maps_anal.enable_grad_report:
+                        self.cross_attn_maps_anal.analyze_gradients_after_backward(self.model)
+
+                    # ------------------------------------------------------------------
                     # 5. ATUALIZAÇÃO DOS PESOS
+                    # ------------------------------------------------------------------
                     self.model.optimizer.step()
                     self.model.optimizer.zero_grad(set_to_none=True)
 
-                    # 6. ANÁLISE DE ATENÇÃO E LIMPEZA (Final do passo)
-                    if self.token_analyzer:
-                        self.token_analyzer.analyze_attention_after_step(self.model, train_progress.epoch)
-                        # Desinstala os hooks de atenção
-                        if self.token_analyzer.enable_attn_report:
-                            self.token_analyzer.stop_analysis_hooks(self.model)
+                    # ------------------------------------------------------------------
+                    # 6. ANÁLISE DE ATENÇÃO (PÓS-PASSO)
+                    # ------------------------------------------------------------------
+                    # Usa os dados que foram coletados durante o forward pass DENTRO do `with`
+                    if capture_attn_now and self.cross_attn_maps_anal:
+                        self.cross_attn_maps_anal.analyze_attention_after_step(maps_from_forward, train_progress.epoch)       
+
+                        # Envia para o TensorBoard
+                        per_head_entropies = self.cross_attn_maps_anal.get_per_head_entropy(
+                            attn_maps_raw=maps_from_forward, batch=batch
+                        )
+                        from collections import defaultdict
+
+                        per_layer = defaultdict(dict)               # {'layer': {'h00': v, 'h01': v, ...}}
+
+                        for full_tag, val in per_head_entropies.items():
+                            try:
+                                layer, head = full_tag.rsplit('_h', 1)   # corta só na última ocorrência
+                            except ValueError:
+                                raise RuntimeError(f'Tag estranho: {full_tag}')
+                            per_layer[layer][f'h{head}'] = float(val)    # garante float
+
+                        # agora loga – UM card por layer, N linhas por cabeça
+                        step = train_progress.global_step
+                        for layer, heads_dict in per_layer.items():
+                            assert isinstance(heads_dict, dict) and heads_dict, 'heads_dict vazio?'
+                            self.tensorboard.add_scalars(
+                                main_tag=f'Entropy/{layer}',
+                                tag_scalar_dict=heads_dict,              # {'h00': 5.20, 'h01': 5.64, ...}
+                                global_step=step,
+                            )
 
                     has_gradient = True
                     accumulated_loss += loss.item()
@@ -1035,9 +1088,6 @@ class GenericTrainer(BaseTrainer):
 
         elif self.model is not None:
             self.model.to(self.temp_device)
-
-        if self.token_analyzer:
-          self.token_analyzer.stop_analysis_hooks(self.model)
 
         self.tensorboard.close()
 

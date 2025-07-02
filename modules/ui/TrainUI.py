@@ -35,9 +35,6 @@ import torch
 
 import customtkinter as ctk
 
-from modules.sangoi.SangoiTab import SangoiTab
-
-
 class TrainUI(ctk.CTk):
     set_step_progress: Callable[[int, int], None]
     set_epoch_progress: Callable[[int, int], None]
@@ -453,13 +450,27 @@ class TrainUI(ctk.CTk):
         frame.pack(fill="both", expand=1) # Empacote o frame para preencher a tab
         
         frame.grid_columnconfigure(0, weight=0) 
-        frame.grid_columnconfigure(1, weight=1) 
+        frame.grid_columnconfigure(1, weight=0) 
         frame.grid_columnconfigure(2, weight=0) 
-        frame.grid_columnconfigure(3, weight=1) 
-        frame.grid_columnconfigure(4, weight=0) 
+        frame.grid_columnconfigure(4, weight=0)
         frame.grid_columnconfigure(5, weight=1)
 
         row_index = 0
+
+        components.label(frame, row_index, 0, "Cross Attention Heatmaps", tooltip="Gera um heatmap da cross-attention a cada step conforme intervalo.")
+        components.switch(frame, row_index, 1, self.ui_state, "enable_cross_attn_maps_anal")
+
+        components.label(frame, row_index, 2, "Analyzer Epoch Interval", tooltip="Intervalo em epochs entre cada análise")
+        components.entry(frame, row_index, 3, self.ui_state, "analyzer_heatmap_interval")
+        row_index += 1
+        
+        components.label(frame, row_index, 0, "Token Grad Analyzer", tooltip="Analisar o gradiente dos tokens.")
+        components.switch(frame, row_index, 1, self.ui_state, "analyzer_enable_grad_report")
+        row_index += 1
+        
+        components.label(frame, row_index, 0, "Token Score Analyzer", tooltip="Analisar o score dos tokens.")
+        components.switch(frame, row_index, 1, self.ui_state, "analyzer_enable_attn_report")
+        row_index += 1
 
         # CORREÇÃO AQUI: Use 'frame' (que é o seu scrollable frame) em vez de 'self.main_frame'
         # Slot 1

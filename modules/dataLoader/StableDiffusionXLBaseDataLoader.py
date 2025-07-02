@@ -4,6 +4,7 @@ import os
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
+from modules.sangoi.AddVariationInfo import AddVariationInfo
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
@@ -174,6 +175,7 @@ class StableDiffusionXLBaseDataLoader(
             'image_path', 'latent_image',
             'tokens_1', 'tokens_2',
             'original_resolution', 'crop_resolution', 'crop_offset', 'prompt',
+            'concept_name', 'variation_index'
         ]
 
         if config.masked_training or config.model_type.has_mask_input():
@@ -269,8 +271,14 @@ class StableDiffusionXLBaseDataLoader(
         inpainting_modules = self._inpainting_modules(config)
         preparation_modules = self._preparation_modules(config, model)
         cache_modules = self._cache_modules(config, model)
+        
+        add_variation_info = AddVariationInfo(
+            variation_out_name='variation_index',
+            concept_name_in_name='concept.name',
+            concept_name_out_name='concept_name'
+        )
+        
         output_modules = self._output_modules(config, model)
-
         debug_modules = self._debug_modules(config, model)
 
         return self._create_mgds(
@@ -285,6 +293,7 @@ class StableDiffusionXLBaseDataLoader(
                 inpainting_modules,
                 preparation_modules,
                 cache_modules,
+                add_variation_info,
                 output_modules,
 
                 debug_modules if config.debug_mode else None,

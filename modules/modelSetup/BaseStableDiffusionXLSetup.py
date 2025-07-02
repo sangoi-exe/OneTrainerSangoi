@@ -1,4 +1,5 @@
 from abc import ABCMeta
+from contextlib import contextmanager
 from random import Random
 from typing import List
 
@@ -29,10 +30,25 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-
 from diffusers.models.attention_processor import AttnProcessor, AttnProcessor2_0, XFormersAttnProcessor, Attention
 from diffusers.utils import is_xformers_available
 
+class CaptureManager:
+    def __init__(self, logger): self.logger = logger; self._orig = None
+    @contextmanager
+    def capture_cross(self, model):
+        if self._orig is not None: raise RuntimeError("capture já ativo")
+        self._orig = {}
+        for name, mod in model.unet.named_modules():
+            if isinstance(mod, Attention) and "attn2" in name:
+                self._orig[name] = mod.processor
+                mod.set_processor(CapturingAttnProcessor(self.logger))
+        try:
+            yield
+        finally:
+            for name, p in self._orig.items():
+                model.unet.get_submodule(name).set_processor(p)
+            self._orig = None
 
 class AttentionMapLogger:
     def __init__(self):
@@ -50,62 +66,86 @@ class AttentionMapLogger:
         return self.attention_maps
 
 class CapturingAttnProcessor:
-    def __init__(self, logger: AttentionMapLogger):
+    """
+    Processor drop-in que:
+      • devolve a MESMA saída do AttnProcessor2_0 (usa o kernel fused)
+      • loga o mapa de atenção (B, H, Q, K) em FP32, fora do grafo
+    """
+    def __init__(self, logger):
         self.logger = logger
-        self.instance_id = id(self)
+        self.fast = AttnProcessor2_0()          # reutiliza o original
 
-    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
-        
-        try:
-            # 1. Inspeção dos Inputs
-            batch_size, sequence_length, _ = hidden_states.shape
-            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+    def __call__(self,
+                 attn: Attention,
+                 hidden_states: torch.Tensor,
+                 encoder_hidden_states: torch.Tensor | None = None,
+                 attention_mask: torch.Tensor | None = None,
+                 temb: torch.Tensor | None = None,
+                 *args, **kw) -> torch.Tensor:
 
-            query = attn.to_q(hidden_states)
-            
-            encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-            key = attn.to_k(encoder_hidden_states)
-            value = attn.to_v(encoder_hidden_states)
+        # ----------   1) projeções – igual ao AttnProcessor2_0   ----------
+        residual = hidden_states
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
 
-            query = attn.head_to_batch_dim(query)
-            key = attn.head_to_batch_dim(key)
-            value = attn.head_to_batch_dim(value)
+        if hidden_states.ndim == 4:                       # (B,C,H,W) → (B,HW,C)
+            b, c, h, w = hidden_states.shape
+            hidden_states = hidden_states.view(b, c, h*w).transpose(1, 2)
 
-            attention_probs = attn.get_attention_scores(query, key, attention_mask)
-            # `attention_probs` aqui tem o shape problemático: (B * H, Q, K)
+        if encoder_hidden_states is None:
+            enc = hidden_states
+        else:
+            enc = attn.norm_encoder_hidden_states(encoder_hidden_states) if attn.norm_cross else encoder_hidden_states
 
-            # 1. Obtenha os parâmetros necessários para o reshape.
-            num_heads = attn.heads
-            b_times_h, q_len, k_len = attention_probs.shape
-            
-            # Inferimos o batch size real que a UNet viu (geralmente 1 ou 2 com CFG)
-            inferred_batch_size = b_times_h // num_heads
+        query = attn.to_q(hidden_states)
+        key   = attn.to_k(enc)
+        value = attn.to_v(enc)
 
-            # 2. RESHAPE para o formato canônico (B, H, Q, K).
-            map_reshaped = attention_probs.view(inferred_batch_size, num_heads, q_len, k_len)
+        bs, _, _ = query.shape
+        head_dim = query.shape[-1] // attn.heads
+        query = query.view(bs, -1, attn.heads, head_dim).transpose(1, 2)   # (B,H,Q,D)
+        key   = key  .view(bs, -1, attn.heads, head_dim).transpose(1, 2)   # (B,H,K,D)
+        value = value.view(bs, -1, attn.heads, head_dim).transpose(1, 2)   # (B,H,K,D)
 
-            # 3. PASSE O TENSOR CORRETO PARA O LOGGER.
-            # Nós só logamos se houver gradiente, para focar na passagem condicional.
-            if map_reshaped.requires_grad:
-                # O logger agora recebe um tensor limpo.
-                # E ele não precisa mais fazer nenhuma média.
-                self.logger(map_reshaped)
+        if attn.norm_q is not None: query = attn.norm_q(query)
+        if attn.norm_k is not None: key   = attn.norm_k(key)
 
-            # O resto da função continua como antes.
-            hidden_states = torch.bmm(attention_probs, value)
-            hidden_states = attn.batch_to_head_dim(hidden_states)
-            hidden_states = attn.to_out[0](hidden_states)
-            hidden_states = attn.to_out[1](hidden_states)
+        # ----------   2) LOG do mapa – fora do autograd   ----------
+        if self.logger is not None and torch.is_grad_enabled():
+            with torch.no_grad():
+                qf = query.float()
+                kf = key.float()
+                scores = (qf @ kf.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
 
-            return hidden_states
-        except Exception as e:
-            print(f"!!!!!!!!!! ERRO DENTRO DO CAPTURING PROCESSOR !!!!!!!!!!!")
-            print(f"  Erro: {e}")
-            import traceback
-            traceback.print_exc()
-            print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            # Lança o erro de novo para não quebrar o fluxo de execução de forma silenciosa
-            raise e
+                if attention_mask is not None:
+                    m = attn.prepare_attention_mask(attention_mask, key.size(-2), bs)
+                    scores += m.view(bs, attn.heads, 1, -1).float()
+
+                probs = scores.softmax(dim=-1)           # (B,H,Q,K) FP32
+                self.logger(probs.cpu())                 # move p/ host, sem ocupar VRAM
+
+        # ----------   3) saída oficial – kernel fused   ----------
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, key.size(-2), bs)
+            attention_mask = attention_mask.view(bs, attn.heads, -1, attention_mask.shape[-1])
+
+        out = F.scaled_dot_product_attention(
+            query, key, value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False
+        )
+
+        out = out.transpose(1, 2).reshape(bs, -1, attn.heads * head_dim)
+        out = attn.to_out[0](out)
+        out = attn.to_out[1](out)
+
+        if hidden_states.ndim == 4:                      # volta p/ (B,C,H,W) se preciso
+            out = out.transpose(-1, -2).reshape(bs, c, h, w)
+
+        if attn.residual_connection:
+            out += residual
+        return out / attn.rescale_output_factor
 
 
 class BaseStableDiffusionXLSetup(
