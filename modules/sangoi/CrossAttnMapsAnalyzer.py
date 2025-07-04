@@ -1,20 +1,29 @@
+from collections import defaultdict
 import re
 import os
 import torch
+
 import pathlib
 import numpy as np
 import torch.nn.functional as F
 import matplotlib
 
+from modules.model.StableDiffusionXLModel import StableDiffusionXLModel
+from modules.util.config.TrainConfig import TrainConfig
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from modules.util.time_util import get_string_timestamp
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, cast
 
 # Assumindo que estas classes estão em um módulo acessível, como você definiu.
-from modules.modelSetup.BaseStableDiffusionXLSetup import AttentionMapLogger, CaptureManager
+from transformers import CLIPTokenizer
 from diffusers.models.attention_processor import Attention
+from modules.modelSetup.BaseStableDiffusionXLSetup import AttentionMapLogger, CaptureManager
+
+from torch import Tensor
+
 
 class CrossAttnMapsAnalyzer:
     """
@@ -24,29 +33,36 @@ class CrossAttnMapsAnalyzer:
 
     def __init__(
         self,
-        config,
-        model,
-        tokenizer_l,
-        tokenizer_g,
+        drop_head_mask,
+        config: TrainConfig,
+        model: StableDiffusionXLModel,
+        tokenizer_l: CLIPTokenizer,
+        tokenizer_g: CLIPTokenizer,
         out_dir: str = "token_affinity_reports",
     ):
         """
         Construtor simplificado e focado no essencial.
         """
         # --- Configurações Essenciais ---
+        self.model = model
+        self.analyzer_interval = config.analyzer_interval
         self.enable_attn_report = config.analyzer_enable_attn_report
         self.enable_grad_report = config.analyzer_enable_grad_report
-        self.heatmap_interval = config.analyzer_heatmap_interval
+        self.enable_heatmap_report = config.analyzer_enable_heatmaps
         self.tokenizer_l = tokenizer_l
         self.tokenizer_g = tokenizer_g
+        self.drop_head_mask = drop_head_mask
 
         # --- Ferramentas e Estado ---
         self.map_logger = AttentionMapLogger()
-        self.cap_manager = CaptureManager(self.map_logger)
+        self.cap_manager = CaptureManager(logger=self.map_logger, drop_mask_ref=self.drop_head_mask)
         
-        self._grad_l: Optional[torch.Tensor] = None
-        self._grad_g: Optional[torch.Tensor] = None
+        self._grad_l: Optional[Tensor] = None
+        self._grad_g: Optional[Tensor] = None
         self.pending_data: Dict[str, Any] = {}
+        
+        self.strikes = defaultdict(int)
+        self.reinits = defaultdict(int)
         
         # --- Setup do Diretório de Saída ---
         base_out_dir = pathlib.Path(out_dir)
@@ -58,17 +74,76 @@ class CrossAttnMapsAnalyzer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[TokenAnalyzer] Inicializado. Device: {self.device}")
 
-        self.prompt_template: Dict[str, Any] = {
-            "token_ids": None,
-            "token_texts": None
-        }
-        self.template_set = False
+        self.templates: Dict[str, Dict[str, Any]] = {}
 
-        self.layer_names = [
-            name.replace('.', '_')
-            for name, m in model.unet.named_modules()
-            if isinstance(m, Attention) and "attn2" in name
-        ]
+        self.alias2path = {}
+        self.layer_aliases = []
+        for path, m in self.model.unet.named_modules():
+            if isinstance(m, Attention) and "attn2" in path:
+                alias = path.replace('.', '_') # padroniza
+                self.alias2path[alias] = path
+                self.layer_aliases.append(alias) # ordem idêntica à captura
+                
+    def path_to_alias(path: str) -> str:
+        return path.replace('.', '_')
+    
+    def update_strike_count(self, per_head_entropy, thr: float = 3.3, patience: int = 3):
+        """
+        Atualiza strikes e devolve lista de heads que bateram o limite.
+        - thr      : entropia abaixo deste valor conta strike.
+        - patience : nº de strikes antes de tentar reinit.
+        """
+        killers = self.drop_head_mask
+        for tag, val in per_head_entropy.items():
+            if killers.get(tag):
+                continue
+            # zera strike se a entropia subir; soma se continuar baixa
+            self.strikes[tag] = self.strikes[tag] + 1 if val < thr else 0
+
+        # devolve quem excedeu patience
+        return [t for t, s in self.strikes.items() if s >= patience]
+
+    def _reinit_heads(self, dead_tags, std: float = 0.01):
+        """
+        Reinicializa ou guilhotina heads.
+        - tag formato: "<alias>_hXX" (alias = path com '_' )
+        """
+        for tag in dead_tags:
+            # 1. Se já reiniciei 3 vezes, dropa de vez
+            if self.reinits[tag] >= 3:
+                self.drop_head_mask[tag] = True
+                self.strikes.pop(tag, None)
+                continue
+
+            # 2. Resolve alias → módulo
+            try:
+                alias, hstr = tag.rsplit('_h', 1)
+                head_idx = int(hstr)
+                path = self.alias2path[alias]
+                mod = self.model.unet.get_submodule(path)
+            except (ValueError, KeyError, AttributeError):
+                print(f"[WARN] Tag inválida ou módulo inexistente: {tag}")
+                continue
+            if not isinstance(mod, Attention):
+                print(f"[WARN] {path} não é Attention. Pulando.")
+                continue
+
+            # 3. Slice dos parâmetros da cabeça
+            heads  = getattr(mod, "num_heads", getattr(mod, "heads"))
+            head_dim = mod.to_q.weight.shape[0] // heads
+            s, e = head_idx * head_dim, (head_idx + 1) * head_dim
+
+            for proj in (mod.to_q, mod.to_k, mod.to_v, mod.to_out[0]):
+                with torch.no_grad():
+                    torch.nn.init.normal_(proj.weight.data[s:e], 0.0, std)
+                    if proj.bias is not None:
+                        torch.nn.init.zeros_(proj.bias.data[s:e])
+
+            # 4. Livro-caixa
+            self.reinits[tag] += 1
+            self.strikes[tag] = 0
+            print(f"[REINIT] {tag} reiniciada ({self.reinits[tag]}×).")
+
 
     def set_pending_analysis(self, step: int, batch: Dict[str, Any]):
         """Prepara para um novo passo de análise. Limpa o estado antigo."""
@@ -77,7 +152,7 @@ class CrossAttnMapsAnalyzer:
         self.map_logger.clear()
         self.pending_data = {"step": step, "batch": batch}
 
-    def analyze_gradients_after_backward(self, model: torch.nn.Module):
+    def analyze_gradients_after_backward(self, model: StableDiffusionXLModel):
         """Chamado após loss.backward() para analisar gradientes."""
         if not self.enable_grad_report:
             return
@@ -87,7 +162,7 @@ class CrossAttnMapsAnalyzer:
         if not batch: return
 
         try:
-            self._analyze_tokens_from_gradient(model, step, batch)
+            self._analyze_tokens_from_gradient(step, batch)
         except Exception as e:
             print(f"[TokenAnalyzer] ERRO ao analisar gradientes (Step {step}): {e}")
             import traceback
@@ -105,8 +180,8 @@ class CrossAttnMapsAnalyzer:
                 self._analyze_attention_scores(attn_maps_to_analyze, step, batch)
             
             # Geração de Heatmaps em intervalos
-            is_heatmap_step = self.heatmap_interval > 0 and (current_epoch % self.heatmap_interval == 0)
-            if is_heatmap_step:
+            analyzer_interval = self.analyzer_interval > 0 and (current_epoch % self.analyzer_interval == 0)
+            if analyzer_interval:
                 self._visualize_attention_heatmaps(attn_maps_to_analyze, step, batch)
         except Exception as e:
             print(f"[TokenAnalyzer] ERRO ao analisar atenção/heatmaps (Step {step}): {e}")
@@ -115,7 +190,7 @@ class CrossAttnMapsAnalyzer:
         finally:
             self.pending_data.clear()
 
-    def _analyze_tokens_from_gradient(self, model, step: int, batch: Dict[str, Any]):
+    def _analyze_tokens_from_gradient(self, step: int, batch: Dict[str, Any]):
         """
         Função que analisa a atribuição de gradiente.
         """
@@ -126,8 +201,7 @@ class CrossAttnMapsAnalyzer:
         else:
             cached_g = batch.get('text_encoder_2_hidden_state')
             if cached_g is not None and cached_g.grad is not None:
-                grad_g = -cached_g.grad
-            
+                grad_g = -cached_g.grad            
             cached_l = batch.get('text_encoder_1_hidden_state')
             if cached_l is not None and cached_l.grad is not None:
                 grad_l = -cached_l.grad
@@ -174,20 +248,23 @@ class CrossAttnMapsAnalyzer:
 
         self._save_prompt_based_report(step, batch, total_scores, "Attention_Attribution")
 
-    def _visualize_attention_heatmaps(self, attn_maps_raw, step: int, batch: Dict[str, Any]):
+    def _visualize_attention_heatmaps(self, attn_maps_raw: List[Tensor], step: int, batch: Dict[str, Any]):
         """
         Orquestrador principal: agrega os mapas e chama a função de plotagem
         para ambos os conjuntos de tokens (CLIP-L e CLIP-G).
         """
+
         if not attn_maps_raw:
             print(f"[TokenAnalyzer] SEM ATTENTION MAP PRO HEATMAP")
             return
-
         try:
-            base_batch_size = batch['tokens_1'].shape[0]
-            conditional_maps = [m[:base_batch_size] for m in attn_maps_raw]
+            base_batch_size: int = batch['tokens_1'].shape[0]
+            conditional_maps: List[Tensor] = [m[:base_batch_size] for m in attn_maps_raw]
+            
+            latent: Tensor = cast(Tensor, batch['latent_image'])
+            latent_h: int = int(latent.shape[2])
+            latent_w: int = int(latent.shape[3])
 
-            latent_h, latent_w = batch['latent_image'].shape[2], batch['latent_image'].shape[3]
             aspect_ratio = latent_h / latent_w if latent_w > 0 else 1.0
 
             min_q_dim = min(m.shape[2] for m in conditional_maps)
@@ -195,10 +272,10 @@ class CrossAttnMapsAnalyzer:
 
             if target_h == -1: return
 
-            normalized_maps = []
+            normalized_maps: List[Tensor] = []
             for cond_map in conditional_maps:
-                map_avg_heads = cond_map.mean(dim=1)
-                current_q_dim = map_avg_heads.shape[1]
+                map_avg_heads: Tensor = cond_map.mean(dim=1)
+                current_q_dim: int = map_avg_heads.shape[1]
                 current_h, current_w = self._infer_spatial_dims(current_q_dim, aspect_ratio)
                 if current_h == -1: continue
                 
@@ -212,120 +289,157 @@ class CrossAttnMapsAnalyzer:
             aggregated_heatmap_data = torch.stack(normalized_maps).mean(dim=0).squeeze(0).to(torch.float32).cpu().numpy()
 
             # --- ETAPA 2: LÓGICA DE GABARITO E ORDENAÇÃO ---
-            concept_name = batch.get("concept", "default")[0]
+            concept_name = batch.get("concept_name", "default")[0]
+            img_key = batch.get("image_path", [""])[0]
             current_token_ids = batch['tokens_2'][0] # Usa CLIP-G
 
-            # Se este é o primeiro conceito 'orig', salvamos como gabarito.
-            if concept_name == 'orig' and not self.template_set:
-                self.prompt_template["token_ids"] = current_token_ids.cpu().numpy()
-                self.prompt_template["token_texts"] = [self.tokenizer_g.decode(tid) for tid in current_token_ids]
-                self.template_set = True
-                print(f"[ANALYSIS] Gabarito de prompt 'orig' salvo no step {step}.")
+            template = self.templates.get(img_key)
 
-            # --- ETAPA DE ORQUESTRAÇÃO DA PLOTAGEM ---
-            _, image_tag = self._get_common_report_header(step, batch, "")
+            if concept_name == "orig" and template is None:
+                self.templates[img_key] = {
+                    "ids": current_token_ids.cpu().numpy(),
+                    "txts": [self.tokenizer_g.decode(t) for t in current_token_ids],
+                }
+                template = self.templates[img_key]
+                print(f"[ANALYSIS] Gabarito salvo para '{img_key}' (step {step}).")
 
-            if self.template_set and concept_name != 'orig':
-                # Mapa de reordenação: {id_do_token_gabarito: indice_do_heatmap_atual}
-                current_id_to_idx = {tid.item(): i for i, tid in enumerate(current_token_ids)}
+            # Se temos um gabarito, SEMPRE plotamos na ordem do gabarito.
+            if template is not None and concept_name != "orig":
+                # 1. Cria um mapa de posições para os tokens do prompt ATUAL.
+                #    {token_id: [lista_de_indices_onde_ele_aparece]}
+                #    Ex: {123: [2, 15], 456: [8]}
+                current_positions = defaultdict(list)
+                for idx, tid in enumerate(current_token_ids.tolist()):
+                    current_positions[tid].append(idx)
+
+                # 2. Constrói os dados ordenados para a plotagem.
+                ordered_heatmap_data_list = []
+                ordered_token_texts_list = []
+                ordered_token_ids_list = []
                 
-                # Cria um novo tensor de dados de heatmap na ordem do gabarito.
-                ordered_heatmap_data = np.zeros_like(aggregated_heatmap_data)
-                for i, template_id in enumerate(self.prompt_template["token_ids"]):
-                    if template_id in current_id_to_idx:
-                        current_idx = current_id_to_idx[template_id]
-                        ordered_heatmap_data[i] = aggregated_heatmap_data[current_idx]
-                
-                # Plota usando os dados reordenados e os tokens do gabarito.
-                self._plot_and_save_heatmap(
-                    step, image_tag, ordered_heatmap_data, 
-                    self.prompt_template["token_ids"], self.prompt_template["token_texts"], 
-                    f"{concept_name}_vs_orig"
-                )
+                # Contador para saber qual ocorrência de um token repetido já usamos.
+                # Ex: {123: 0} -> ainda não usamos nenhuma instância do token 123.
+                usage_counter = defaultdict(int)
+
+                # 3. Itera sobre o GABARITO para definir a ordem.
+                for tid, txt in zip(template["ids"], template["txts"]):
+                    
+                    # Pega a contagem de uso para este ID de token
+                    occurrence_index = usage_counter[tid]
+                    
+                    # Verifica se o prompt ATUAL tem essa ocorrência do token
+                    if occurrence_index < len(current_positions[tid]):                        
+                        # Se sim, pega o índice do heatmap correspondente no lote atual
+                        current_heatmap_index = current_positions[tid][occurrence_index]                        
+                        # Adiciona os dados na ordem correta
+                        ordered_heatmap_data_list.append(aggregated_heatmap_data[current_heatmap_index])
+                        ordered_token_texts_list.append(txt)
+                        ordered_token_ids_list.append(tid)                        
+                        # Incrementa o contador de uso para este ID
+                        usage_counter[tid] += 1
+
+                if not ordered_heatmap_data_list:
+                    print(f"[WARN] Sem match entre template '{img_key}' e prompt atual.")
+                    return
+
+                # Converte as listas para os formatos corretos para a função de plotagem
+                final_heatmap_data = np.stack(ordered_heatmap_data_list)
+                final_token_ids = np.array(ordered_token_ids_list)
+                final_token_texts = ordered_token_texts_list
+                output_suffix = f"{concept_name}"
             else:
                 # Se for o 'orig' ou se não houver gabarito, plota na ordem normal.
-                token_texts = [self.tokenizer_g.decode(tid) for tid in current_token_ids]
-                self._plot_and_save_heatmap(
-                    step, image_tag, aggregated_heatmap_data, 
-                    current_token_ids.cpu().numpy(), token_texts, 
-                    concept_name
-                )
+                final_heatmap_data = aggregated_heatmap_data
+                final_token_ids = current_token_ids.cpu().numpy()
+                final_token_texts = [self.tokenizer_g.decode(tid) for tid in current_token_ids]
+                output_suffix = concept_name
+                
+            # Chama a função de plotagem com os dados devidamente ordenados e formatados
+            _, image_tag = self._get_common_report_header(step, batch, "")
+            self._plot_and_save_heatmap(
+                step,
+                image_tag,
+                final_heatmap_data,
+                final_token_ids,
+                final_token_texts,
+                output_suffix
+            )
 
         except Exception as e:
             print(f"[TokenAnalyzer] ERRO ao gerar heatmap de atenção: {e}")
             import traceback
             traceback.print_exc()
 
-    def _plot_and_save_heatmap(self, step: int, image_tag: str, heatmap_data: np.ndarray, 
-                              token_ids: np.ndarray, token_texts: list, output_suffix: str):
+    def _plot_and_save_heatmap(
+            self,
+            step: int,
+            image_tag: str,
+            heatmap_data: np.ndarray,
+            token_ids: np.ndarray,
+            token_texts: list,
+            output_suffix: str,
+            max_cols: int = 8,
+        ):
         """
-        Plota um grid de heatmaps com layout adaptativo para diferentes aspect ratios.
+        Renderiza heatmaps sem matar pontuação,
+        com grid adaptativo e títulos que não colidem.
         """
-        # 1. Filtra os tokens que realmente importam (sua lógica atual está boa)
-        tokens_to_plot = []
-        indices_to_plot = []
-        for i, token_text in enumerate(token_texts):
-            token_id = token_ids[i]
-            is_special = token_id in [self.tokenizer_g.eos_token_id, self.tokenizer_g.pad_token_id, self.tokenizer_g.bos_token_id]
-            if is_special: continue
-            if token_text.strip() == '': continue
-            tokens_to_plot.append(token_text.replace('</w>', '').strip())
-            indices_to_plot.append(i)
 
-        if not tokens_to_plot: return
+        SPECIAL = set(self.tokenizer_g.all_special_ids)
 
-        heatmaps_to_plot = heatmap_data[indices_to_plot, :, :]
-        num_tokens_to_plot = len(tokens_to_plot)
+        # ---------- FILTRO ----------
+        keep   = []
+        labels = []
+        for i, (tid, txt) in enumerate(zip(token_ids, token_texts)):
+            if tid in SPECIAL: continue
 
-        # 2. LÓGICA DE LAYOUT ADAPTATIVO
-        # Pega o aspect ratio do *heatmap em si* (H/W)
-        heatmap_h, heatmap_w = heatmaps_to_plot[0].shape
-        heatmap_aspect_ratio = heatmap_h / heatmap_w if heatmap_w > 0 else 1.0
+            clean = txt.replace('</w>', '') # mantém vírgula, mantém espaço se houver
+            clean = clean if clean != '' else ',' # token vazio aqui é vírgula pura
+            labels.append(clean)
+            keep.append(i)
 
-        # Define as colunas (você ainda controla isso)
-        cols = 12
-        # Calcula as linhas necessárias
-        rows = (num_tokens_to_plot + cols - 1) // cols
+        if not keep:
+            return
 
-        # Ajusta o `figsize` com base no aspect ratio dos subplots e do grid
-        # A ideia é dar mais espaço vertical para imagens em modo retrato e vice-versa.
-        # A largura da figura é proporcional ao número de colunas.
-        # A altura da figura é proporcional ao número de linhas E ao aspect ratio dos heatmaps.
-        fig_width = cols * 2.5
-        fig_height = rows * (2.5 * heatmap_aspect_ratio) + 1.5 # +1.5 para títulos e margens
-        
-        fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height), dpi=120)
-        fig.suptitle(f'Attention Heatmap ({output_suffix}) - Step {step}', fontsize=16)
-        
-        axes_flat = axes.flat if num_tokens_to_plot > 1 else [axes]
+        hm = heatmap_data[keep, :, :]
+        n  = len(keep)
 
-        # 3. Plota cada heatmap
-        for i in range(num_tokens_to_plot):
-            ax = axes_flat[i]
-            heatmap = heatmaps_to_plot[i, :, :]
-            ax.imshow(heatmap, cmap='cividis')
-            # Adiciona o índice original para referência
-            ax.set_title(f'{indices_to_plot[i]}: "{tokens_to_plot[i]}"', fontsize=8)
+        # ---------- GRID ----------
+        cols = min(max_cols, max(3, n))           # nunca menos que 3 colunas
+        rows = (n + cols - 1) // cols
+
+        h, w  = hm[0].shape
+        ar    = h / w if w else 1.0
+
+        # largura = 2 in por coluna; altura proporcional + margem p/ títulos
+        fig_w = cols * 2
+        fig_h = rows * (2 * ar) + 0.8
+
+        fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), dpi=200)
+        fig.suptitle(f'Attention Heatmap ({output_suffix}) - Step {step}', fontsize=12)
+
+        axes = axes.flat if isinstance(axes, np.ndarray) else [axes]
+
+        # ---------- PLOT ----------
+        for plot_i, real_i in enumerate(keep):
+            ax = axes[plot_i]
+            ax.imshow(hm[plot_i], cmap='viridis')
+            ax.set_title(f'{real_i}: "{labels[plot_i]}"', fontsize=7, pad=4)
             ax.axis('off')
 
-        # 4. Esconde eixos de subplots não utilizados
-        for i in range(num_tokens_to_plot, len(axes_flat)):
-            axes_flat[i].axis('off')
+        # esconde vazios
+        for j in range(n, len(axes)):
+            axes[j].axis('off')
 
-        # 5. Usa `plt.subplots_adjust` para um controle mais fino que `tight_layout`
-        # Isso ajuda a evitar a sobreposição de títulos em imagens quadradas.
         plt.subplots_adjust(
-            left=0.02, 
-            right=0.98, 
-            top=0.92 if fig_height > 5 else 0.85, # Deixa mais espaço para o título principal em figuras altas
-            bottom=0.02,
-            hspace=0.4, # Aumenta o espaço horizontal entre os plots
-            wspace=0.1  # Aumenta o espaço vertical entre os plots
+            left=0.03, right=0.97,
+            top=0.88 if rows == 1 else 0.90,
+            bottom=0.04,
+            wspace=0.08, hspace=0.25
         )
-        
-        # 6. Salva como JPEG
-        outfile = self.out_dir / f"{image_tag}_HEATMAP_step_{step:06d}_{output_suffix}.jpg"
-        plt.savefig(outfile, format='jpeg', dpi=96, pil_kwargs={'quality': 85})
+
+        out = self.out_dir / f"{image_tag}_HEATMAP_step_{step:06d}_{output_suffix}.jpg"
+        plt.savefig(out, format='jpeg', dpi=96, pil_kwargs={'quality': 85})
         plt.close(fig)
 
     @staticmethod
@@ -368,15 +482,16 @@ class CrossAttnMapsAnalyzer:
         report_header, image_tag = self._get_common_report_header(step, batch, report_type)
         
         token_ids = batch['tokens_2'][0] # Usa CLIP-G como referência
-        tokens_text = [self.tokenizer_g.decode(tid) for tid in token_ids]
-
+        tokens_text = self.tokenizer_g.convert_ids_to_tokens(token_ids, skip_special_tokens=False)
+        
+        special = set(self.tokenizer_g.all_special_ids)
         scored_tokens = []
         for i, score in enumerate(scores):
             token_id = token_ids[i].item()
             token_text = tokens_text[i].replace('</w>', '').strip()
             
-            if token_text in [self.tokenizer_g.eos_token, self.tokenizer_g.pad_token, self.tokenizer_g.bos_token, '']:
-                continue
+            if token_id in special: continue
+            if token_text in ['<|endoftext|>', '</s>']: continue # seguro morreu de velho
             
             scored_tokens.append({'text': token_text, 'id': token_id, 'score': score.item()})
 
@@ -462,10 +577,62 @@ class CrossAttnMapsAnalyzer:
         if B == 0: return None
 
         per_head = {}
-        for layer_name, raw in zip(self.layer_names, attn_maps_raw):
+        for alias, raw in zip(self.layer_aliases, attn_maps_raw):
             p = raw[:B].float().clamp_min_(1e-9)
-            ent = -(p * p.log2()).sum(-1) # (B, H, Q)
-            ent_h = ent.mean(dim=(0, 2)) # (H,)
+            ent = -(p * p.log2()).sum(-1)        # (B,H,Q)
+            ent_h = ent.mean(dim=(0, 2))         # (H,)
             for h, v in enumerate(ent_h):
-                per_head[f"{layer_name}_h{h:02d}"] = v.item()
+                per_head[f"{alias}_h{h:02d}"] = v.item()
         return per_head
+    
+    def report_head_health(self, epoch: int | str):
+        """
+        Imprime no terminal um sumário do estado das heads
+        ao final da epoch.
+
+        • Guilhotinadas  → estão marcadas em drop_head_mask=True
+        • Strikes ativos → strikes[tag] > 0 e ainda não guilhotinadas
+        """
+        # garante que os dicionários existam
+        killers = [tag for tag, dropped in getattr(self, "drop_head_mask", {}).items() if dropped]
+        reinits = getattr(self, "reinits", {})
+
+        live_strikers = {tag: n for tag, n in self.strikes.items() if n > 0 and tag not in killers}
+
+        print("\n======== HEAD HEALTH REPORT — EPOCH", epoch, "========")
+
+        if killers:
+            print("⚔️  HEADS GUILHOTINADAS (zero-out permanente):")
+            for tag in sorted(killers):
+                n_re = reinits.get(tag, 0)
+                print(f"  • {tag:50s} | reinits: {n_re}")
+        else:
+            print("— Nenhuma cabeça guilhotinada nesta epoch.")
+
+        if live_strikers:
+            print("\n⚠️  HEADS COM STRIKES (ainda vivas):")
+            for tag, n in sorted(live_strikers.items(), key=lambda x: (-x[1], x[0])):
+                print(f"  • {tag:50s} | strikes: {n}")
+        else:
+            print("\n— Nenhum strike ativo.")
+
+        print("===============================================\n")
+
+
+    def _debug_tokenization_methods(self, token_ids: torch.Tensor, concept_name: str):
+        """Compara os diferentes métodos de tokenização"""
+        print(f"\n=== DEBUG TOKENIZATION - {concept_name} ===")
+        
+        for i, tid in enumerate(token_ids.tolist()):
+            # Método atual (problemático)
+            convert_result = self.tokenizer_g.convert_ids_to_tokens([tid])[0]
+            
+            # Método melhor
+            decode_result = self.tokenizer_g.decode([tid]).strip()
+            
+            print(f"  {i:2d}: ID={tid:5d} | convert='{convert_result}' | decode='{decode_result}'")
+            
+            if convert_result.replace('</w>', '').strip() != decode_result:
+                print(f"       ^^^ INCONSISTÊNCIA DETECTADA!")
+        
+        print("=" * 50)

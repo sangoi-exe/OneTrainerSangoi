@@ -203,6 +203,20 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
     return losses
 
+  @staticmethod
+  def prepare_mask(mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+      """
+      Mantém valores contínuos [0-1] e só faz:
+        • cast para dtype do ref
+        • broadcast para canais
+      """
+      masq = mask.to(dtype=ref.dtype, device=ref.device) # nada de (mask > thresh)
+      if masq.ndim < ref.ndim: # [B,H,W] → [B,1,H,W]
+          masq = masq.unsqueeze(1)
+      if masq.shape[1] == 1 and ref.shape[1] != 1:
+          masq = masq.expand(ref.shape[0], ref.shape[1], *masq.shape[2:])
+      return masq
+
   def __unmasked_losses(
       self,
       batch: dict,
@@ -217,91 +231,86 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     mae_loss = torch.tensor(0.0, device=data["predicted"].device)
     log_cosh_loss = torch.tensor(0.0, device=data["predicted"].device)
 
+    predicted = data["predicted"].to(torch.float32)
+    target    = data["target"].to(torch.float32)
+
+    if config.masked_training:
+        mask = self.prepare_mask(batch["latent_mask"], predicted)  # float 0-1
+        predicted = predicted * mask
+        target    = target    * mask
+
     # MSE/L2 Loss
     if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
-      mse_loss = F.mse_loss(
-        data["predicted"].to(dtype=torch.float32),
-        data["target"].to(dtype=torch.float32),
-        reduction="none",
-      ).mean([1, 2, 3])
+        mse_loss = F.mse_loss(predicted, target, reduction="none").mean([1, 2, 3])
 
     # MAE/L1 Loss
     if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
-      mae_loss = F.l1_loss(
-        data["predicted"].to(dtype=torch.float32),
-        data["target"].to(dtype=torch.float32),
-        reduction="none",
-      ).mean([1, 2, 3])
+        mae_loss = F.l1_loss(predicted, target, reduction="none").mean([1, 2, 3])
 
     # log-cosh Loss
     if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
-      log_cosh_loss = self.__log_cosh_loss(
-        data["predicted"].to(dtype=torch.float32),
-        data["target"].to(dtype=torch.float32),
-      ).mean([1, 2, 3])
+        log_cosh_loss = self.__log_cosh_loss(predicted, target).mean([1, 2, 3])
     
     match config.loss_mode_fn:
-      case config.loss_mode_fn.ORIGINAL:
-        losses = (
-          mse_loss * config.mse_strength +
-          mae_loss * config.mae_strength +
-          log_cosh_loss * config.log_cosh_strength
-        )
+        case config.loss_mode_fn.ORIGINAL:
+            losses = (
+              mse_loss * config.mse_strength +
+              mae_loss * config.mae_strength +
+              log_cosh_loss * config.log_cosh_strength
+            )
 
-        # VB loss
-        if config.vb_loss_strength != 0 and 'predicted_var_values' in data and self.__coefficients is not None:
-          losses += masked_losses(
-            losses=vb_losses(
-              coefficients=self.__coefficients,
-              x_0=data['scaled_latent_image'].to(dtype=torch.float32),
-              x_t=data['noisy_latent_image'].to(dtype=torch.float32),
-              t=data['timestep'],
-              predicted_eps=data['predicted'].to(dtype=torch.float32),
-              predicted_var_values=data['predicted_var_values'].to(dtype=torch.float32),
-            ),
-            mask=batch['latent_mask'].to(dtype=torch.float32),
-            unmasked_weight=config.unmasked_weight,
-            normalize_masked_area_loss=config.normalize_masked_area_loss,
-          ).mean([1, 2, 3]) * config.vb_loss_strength			
+            # VB loss
+            if config.vb_loss_strength != 0 and 'predicted_var_values' in data and self.__coefficients is not None:
+                losses += masked_losses(
+                  losses=vb_losses(
+                    coefficients=self.__coefficients,
+                    x_0=data['scaled_latent_image'].to(dtype=torch.float32),
+                    x_t=data['noisy_latent_image'].to(dtype=torch.float32),
+                    t=data['timestep'],
+                    predicted_eps=data['predicted'].to(dtype=torch.float32),
+                    predicted_var_values=data['predicted_var_values'].to(dtype=torch.float32),
+                  ),
+                  mask=batch['latent_mask'].to(dtype=torch.float32),
+                  unmasked_weight=config.unmasked_weight,
+                  normalize_masked_area_loss=config.normalize_masked_area_loss,
+                ).mean([1, 2, 3]) * config.vb_loss_strength			
 
-      case config.loss_mode_fn.SANGOI:
-        # Update LossTracker
-        self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
+        case config.loss_mode_fn.SANGOI:
+            # Update LossTracker
+            self.loss_tracker.update(mse_loss, mae_loss, log_cosh_loss)
 
-        # Compute z-scores
-        mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(mse_loss, mae_loss, log_cosh_loss)
+            # Compute z-scores
+            mse_z, mae_z, log_cosh_z = self.loss_tracker.compute_z_scores(mse_loss, mae_loss, log_cosh_loss)
 
-        # Ajusta pesos dinamicamente + scheduler de prioridades
-        mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
-          mse_z, mae_z, log_cosh_z, config, progress
-        )
-        losses = (
-          mse_loss * mse_weight * config.mse_strength
-          + mae_loss * mae_weight * config.mae_strength
-          + log_cosh_loss * log_cosh_weight * config.log_cosh_strength
-        )
+            # Ajusta pesos dinamicamente + scheduler de prioridades
+            mse_weight, mae_weight, log_cosh_weight = self.dynamic_loss_strengthing.adjust_weights(
+              mse_z, mae_z, log_cosh_z, config, progress
+            )
+            losses = (
+              mse_loss * mse_weight * config.mse_strength
+              + mae_loss * mae_weight * config.mae_strength
+              + log_cosh_loss * log_cosh_weight * config.log_cosh_strength
+            )
 
-        if self.tensorboard != None:
-          self.tensorboard.add_scalar(
-            "sangoi/7mse",
-            mse_weight,
-            progress.global_step,
-          )
-          self.tensorboard.add_scalar(
-            "sangoi/8mae",
-            mae_weight,
-            progress.global_step,
-          )
-          self.tensorboard.add_scalar(
-            "sangoi/9log_cosh",
-            log_cosh_weight,
-            progress.global_step,
-          )
+            if self.tensorboard != None:
+                self.tensorboard.add_scalar(
+                  "sangoi/7mse",
+                  mse_weight,
+                  progress.global_step,
+                )
+                self.tensorboard.add_scalar(
+                  "sangoi/8mae",
+                  mae_weight,
+                  progress.global_step,
+                )
+                self.tensorboard.add_scalar(
+                  "sangoi/9log_cosh",
+                  log_cosh_weight,
+                  progress.global_step,
+                )
     
-    if config.masked_training and config.normalize_masked_area_loss:
-      clamped_mask = torch.clamp(batch["latent_mask"], config.unmasked_weight, 1)
-      mask_mean = clamped_mask.mean(dim=(1, 2, 3))
-      losses /= mask_mean
+    mask_mean = batch["latent_mask"].mean((1,2,3)) 
+    losses /= mask_mean
 
     return losses
 

@@ -8,6 +8,7 @@ import sys
 import time
 import traceback
 from collections.abc import Callable
+from collections import defaultdict
 from pathlib import Path
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
@@ -103,7 +104,9 @@ class GenericTrainer(BaseTrainer):
         self.pause_requested_at_epoch_end = False
 
         self._steps_per_epoch = None
-        self.cross_attn_maps_anal = None
+        
+        self.cross_attn_anal = None
+        self.drop_head_mask = {}
 
     def _handle_pause_logic(self):
         """Executa a lógica de pausa, movendo o modelo e esperando."""
@@ -170,30 +173,6 @@ class GenericTrainer(BaseTrainer):
             self.commands.stop()
             self.callbacks.on_update_status(f"Error during pause/resume: {e}")
 
-    @staticmethod
-    def stop_grad_outside_mask(tensor: torch.Tensor, mask_bf16: torch.Tensor) -> None:
-        """
-        Mantém o forward intacto (contexto total) e zera gradiente fora da máscara.
-        * `tensor`: saída bruta do modelo (bf16/fp16/fp32).
-        * `mask`  : mesma shape espacial, dtype float/bool (1 = região de interesse).
-        """
-        def _hook(grad: torch.Tensor) -> torch.Tensor:
-            return grad * mask_bf16       # mesmo dtype → sem crash
-        tensor.register_hook(_hook)
-
-    @staticmethod
-    def prepare_mask(
-        mask: torch.Tensor,
-        ref: torch.Tensor,
-        thresh: float = 0.5
-        ) -> torch.Tensor:
-        """Binariza + broadcasta máscara para ter shape/dtype de `ref`."""
-        m = (mask > thresh).to(dtype=ref.dtype, device=ref.device)
-        if m.ndim < ref.ndim:            # [B,H,W] → [B,1,H,W]
-            m = m.unsqueeze(1)
-        if m.shape[1] == 1 and ref.shape[1] != 1:
-            m = m.expand(ref.shape[0], ref.shape[1], *m.shape[2:])
-        return m
 
     def start(self):
         self.__save_config_to_workspace()
@@ -241,13 +220,14 @@ class GenericTrainer(BaseTrainer):
         self.model_setup.setup_optimizations(self.model, self.config)
         self.model_setup.setup_train_device(self.model, self.config)
         self.model_setup.setup_model(self.model, self.config)
-        if (getattr(self.config, "enable_cross_attn_maps_anal"), False):
+        if (getattr(self.config, "enable_cross_attn_cap"), False):
             print("Ativando Token Gradient Analyzer.")
-            self.cross_attn_maps_anal = CrossAttnMapsAnalyzer(
+            self.cross_attn_anal = CrossAttnMapsAnalyzer(
                 config=self.config,
                 model=self.model,
                 tokenizer_l=self.model.tokenizer_1,
                 tokenizer_g=self.model.tokenizer_2,
+                drop_head_mask=self.drop_head_mask,
                 out_dir=os.path.join(self.config.workspace_dir, "token_affinity_reports"),
             )
 
@@ -765,7 +745,6 @@ class GenericTrainer(BaseTrainer):
         accumulated_loss = 0.0
         ema_loss = None
         for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
-
             if self.is_paused:
                 logFun(f"Treino iniciado em estado PAUSADO (Epoch {train_progress.epoch}). Aguardando resume...", lvl="warning")
                 self._handle_pause_logic()
@@ -868,9 +847,8 @@ class GenericTrainer(BaseTrainer):
 
                 self.callbacks.on_update_status("training")
 
-                # 1. ATIVAÇÃO DE GRADIENTE PARA O MODO CACHE (Custo insignificante)
-                if self.cross_attn_maps_anal and not self.config.train_text_encoder_or_embedding():
-                    
+                # ativar gradientes dos embeddings em caso de treino sem TE
+                if self.cross_attn_anal and not self.config.train_text_encoder_or_embedding():                    
                     hidden_states_l = batch.get('text_encoder_1_hidden_state')
                     if hidden_states_l is not None:
                         hidden_states_l.requires_grad_(True)
@@ -883,90 +861,83 @@ class GenericTrainer(BaseTrainer):
                     if pooled_output_g is not None:
                         pooled_output_g.requires_grad_(True)
 
-                with TorchMemoryRecorder(enabled=False):
-                    # ------------------------------------------------------------------
-                    # 1. DECIDIR SE A ANÁLISE DE ATENÇÃO ESTÁ ATIVA PARA ESTE PASSO
-                    # ------------------------------------------------------------------
-                    capture_attn_now = False
-                    if self.cross_attn_maps_anal:
-                        is_heatmap_step = self.cross_attn_maps_anal.heatmap_interval > 0 and \
-                                          (train_progress.epoch % self.cross_attn_maps_anal.heatmap_interval == 0)
-                        capture_attn_now = is_heatmap_step
+                with TorchMemoryRecorder(enabled=False):                    
+                    is_analyze_step = False
+                    if self.cross_attn_anal: # verificar se o analyzer tá ativado
+                        capture_attn_now = self.cross_attn_anal.analyzer_interval > 0 and \
+                        (train_progress.epoch % self.cross_attn_anal.analyzer_interval == 0) # verificar se a epoch é multipla de 5 e maior que 0
+                        is_analyze_step = capture_attn_now
 
-                    # ------------------------------------------------------------------
-                    # 2. PREPARAR O CONTEXTO E O ANALISADOR
-                    # ------------------------------------------------------------------
-                    if self.cross_attn_maps_anal:
+                    
+                    if self.cross_attn_anal: # verificar se o analyzer tá ativado de novo
                         # Prepara o analisador, limpando o estado do passo anterior
-                        self.cross_attn_maps_anal.prepare_for_step(train_progress.global_step, batch)
+                        self.cross_attn_anal.prepare_for_step(train_progress.global_step, batch)
                         
                     # O context manager só é ativado se precisarmos dos mapas de atenção.
                     # Caso contrário, usamos um contexto nulo para máxima performance.
-                    ctx = self.cross_attn_maps_anal.cap_manager.capture_cross(self.model) \
-                        if capture_attn_now and self.cross_attn_maps_anal else nullcontext()
+                    if self.cross_attn_anal: # obter os attn maps em todos os steps para o tensorboard
+                        ctx = self.cross_attn_anal.cap_manager.capture_cross(self.model)
+                    else:
+                        ctx = nullcontext()
 
-                    # ------------------------------------------------------------------
-                    # 3. FORWARD + BACKWARD (DENTRO DO CONTEXTO PARA O CHECKPOINTING)
-                    # ------------------------------------------------------------------
+                    # usando contextmanager pra sincronizar forward+backward, senão dá erro de grad ckpt
                     with ctx:
-                        # O forward pass que gera os dados para a perda
+                        # 1º forward, faz o predict antes da perda
                         model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                        
-                        # O cálculo da perda
                         loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
 
-                        # PEGA OS DADOS LIMPOS DO FORWARD
-                        maps_from_forward = self.cross_attn_maps_anal.map_logger.get_maps().copy() # .copy() é crucial
-                        
-                        # LIMPA O LOGGER ANTES DO BACKWARD
-                        self.cross_attn_maps_anal.map_logger.clear()
-                        # O backward pass
+                        # clona os maps pra uma variável separada
+                        maps_from_forward = self.cross_attn_anal.map_logger.get_maps().copy() # .copy() é crucial
+
+                        # limpa o map_logger, nem sei se precisa, porque vai ser usado a variável maps_from_forward
+                        self.cross_attn_anal.map_logger.clear()
                         loss = loss / self.config.gradient_accumulation_steps
+                        # o backward, essa bosta também tem um 'mini forward' se grad ckpt tiver ativo
+                        # sem o uso de context manager, o grad ckpt vai ter jogaod fora os tensores dos attn maps
+                        # daí aqui vai dar erro de diferença de quantidade entre o 1º forward e o atual
                         loss.backward()
 
-                    # ------------------------------------------------------------------
-                    # 4. ANÁLISE DE GRADIENTE (PONTO CRÍTICO)
-                    # ------------------------------------------------------------------
-                    if self.cross_attn_maps_anal and self.cross_attn_maps_anal.enable_grad_report:
-                        self.cross_attn_maps_anal.analyze_gradients_after_backward(self.model)
+                    # gerar relatório de gradiente conforme analyzer interval
+                    if is_analyze_step:
+                        self.cross_attn_anal.analyze_gradients_after_backward(self.model)
 
-                    # ------------------------------------------------------------------
-                    # 5. ATUALIZAÇÃO DOS PESOS
-                    # ------------------------------------------------------------------
+                    # passo do optimizer e atualizar pesos
                     self.model.optimizer.step()
                     self.model.optimizer.zero_grad(set_to_none=True)
-
-                    # ------------------------------------------------------------------
-                    # 6. ANÁLISE DE ATENÇÃO (PÓS-PASSO)
-                    # ------------------------------------------------------------------
-                    # Usa os dados que foram coletados durante o forward pass DENTRO do `with`
-                    if capture_attn_now and self.cross_attn_maps_anal:
-                        self.cross_attn_maps_anal.analyze_attention_after_step(maps_from_forward, train_progress.epoch)       
-
-                        # Envia para o TensorBoard
-                        per_head_entropies = self.cross_attn_maps_anal.get_per_head_entropy(
+                    
+                    # gerar relatório de attn score conforme analyzer interval
+                    if is_analyze_step:
+                        self.cross_attn_anal.analyze_attention_after_step(maps_from_forward, train_progress.epoch)
+                    
+                    # calcular a entropia individual de cada cabeça e logar no tensorboard
+                    if self.cross_attn_anal:
+                        per_head_entropies = self.cross_attn_anal.get_per_head_entropy(
                             attn_maps_raw=maps_from_forward, batch=batch
                         )
-                        from collections import defaultdict
+                        
+                        # atualizar stats das cabeças pra eventual reset
+                        if per_head_entropies:
+                            dead_heads = self.cross_attn_anal.update_strike_count(per_head_entropies)
+                            if dead_heads and train_progress.epoch > 5:
+                                self.cross_attn_anal._reinit_heads(dead_heads)
+                            per_layer = defaultdict(dict)
 
-                        per_layer = defaultdict(dict)               # {'layer': {'h00': v, 'h01': v, ...}}
+                            for full_tag, val in per_head_entropies.items():
+                                try:
+                                    layer, head = full_tag.rsplit('_h', 1)
+                                except ValueError:
+                                    raise RuntimeError(f'Tag estranho: {full_tag}')
+                                per_layer[layer][f'h{head}'] = float(val)
 
-                        for full_tag, val in per_head_entropies.items():
-                            try:
-                                layer, head = full_tag.rsplit('_h', 1)   # corta só na última ocorrência
-                            except ValueError:
-                                raise RuntimeError(f'Tag estranho: {full_tag}')
-                            per_layer[layer][f'h{head}'] = float(val)    # garante float
-
-                        # agora loga – UM card por layer, N linhas por cabeça
-                        step = train_progress.global_step
-                        for layer, heads_dict in per_layer.items():
-                            assert isinstance(heads_dict, dict) and heads_dict, 'heads_dict vazio?'
-                            self.tensorboard.add_scalars(
-                                main_tag=f'Entropy/{layer}',
-                                tag_scalar_dict=heads_dict,              # {'h00': 5.20, 'h01': 5.64, ...}
-                                global_step=step,
-                            )
+                            # agora loga – UM card por layer, N linhas por cabeça
+                            step = train_progress.global_step
+                            for layer, heads_dict in per_layer.items():
+                                assert isinstance(heads_dict, dict) and heads_dict, 'heads_dict vazio?'
+                                self.tensorboard.add_scalars(
+                                    main_tag=f'Entropy/{layer}',
+                                    tag_scalar_dict=heads_dict,
+                                    global_step=step,
+                                )
 
                     has_gradient = True
                     accumulated_loss += loss.item()
@@ -1028,7 +999,7 @@ class GenericTrainer(BaseTrainer):
 
                 if self.commands.get_stop_command():
                     return
-            
+            self.cross_attn_anal.report_head_health(train_progress.epoch)
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 

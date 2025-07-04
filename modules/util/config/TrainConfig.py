@@ -252,10 +252,11 @@ class TrainConfig(BaseConfig):
     charbonier_strength: float
     parameters_by_module: bool
     param_group_strategy: str # module | block | stage | type | stage_type | block_type
-    enable_token_grad_analyzer: bool
+    enable_cross_attn_cap: bool
     analyzer_enable_grad_report: bool
     analyzer_enable_attn_report: bool
-    analyzer_heatmap_interval: int
+    analyzer_enable_heatmaps: bool
+    analyzer_interval: int
 
     loss_tracker_window: int
     loss_tracker_use_mad: bool
@@ -761,10 +762,11 @@ class TrainConfig(BaseConfig):
         data.append(("lora_generate_keys_file", False, bool, False))
         data.append(("lora_module_overrides", "", str, False))
         data.append(("bucket_ratio", 64, int, False))
-        data.append(("enable_cross_attn_maps_anal", False, bool, False))
+        data.append(("enable_cross_attn_cap", False, bool, False))
         data.append(("analyzer_enable_grad_report", False, bool, False))
         data.append(("analyzer_enable_attn_report", False, bool, False))
-        data.append(("analyzer_heatmap_interval", 1, int, False)) # 1 = a cada epoch
+        data.append(("analyzer_enable_heatmaps", False, bool, False))
+        data.append(("analyzer_interval", 1, int, False)) # 1 = a cada epoch
 
         # model settings
         data.append(("base_model_name", "stable-diffusion-v1-5/stable-diffusion-v1-5", str, False))

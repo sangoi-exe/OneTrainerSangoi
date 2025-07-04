@@ -34,15 +34,26 @@ from diffusers.models.attention_processor import AttnProcessor, AttnProcessor2_0
 from diffusers.utils import is_xformers_available
 
 class CaptureManager:
-    def __init__(self, logger): self.logger = logger; self._orig = None
+    def __init__(self, logger, drop_mask_ref): 
+        self._orig = None
+        self.logger = logger
+        self.drop_mask_ref = drop_mask_ref
+    
     @contextmanager
-    def capture_cross(self, model):
+    def capture_cross(self, model: StableDiffusionXLModel):
         if self._orig is not None: raise RuntimeError("capture já ativo")
         self._orig = {}
         for name, mod in model.unet.named_modules():
             if isinstance(mod, Attention) and "attn2" in name:
+                alias = name.replace('.', '_') 
                 self._orig[name] = mod.processor
-                mod.set_processor(CapturingAttnProcessor(self.logger))
+                mod.set_processor(
+                    CapturingAttnProcessor(
+                        logger=self.logger,
+                        layer_tag=alias,
+                        drop_mask_ref=self.drop_mask_ref,
+                    )
+)
         try:
             yield
         finally:
@@ -71,10 +82,11 @@ class CapturingAttnProcessor:
       • devolve a MESMA saída do AttnProcessor2_0 (usa o kernel fused)
       • loga o mapa de atenção (B, H, Q, K) em FP32, fora do grafo
     """
-    def __init__(self, logger):
+    def __init__(self, logger, layer_tag: str, drop_mask_ref: dict | None = None):
         self.logger = logger
-        self.fast = AttnProcessor2_0()          # reutiliza o original
-
+        self.fast = AttnProcessor2_0()
+        self.layer_tag = layer_tag
+        self.drop_mask_ref = drop_mask_ref or {}        
     def __call__(self,
                  attn: Attention,
                  hidden_states: torch.Tensor,
@@ -110,6 +122,17 @@ class CapturingAttnProcessor:
         if attn.norm_q is not None: query = attn.norm_q(query)
         if attn.norm_k is not None: key   = attn.norm_k(key)
 
+        # ---------- 2) ***DROP-HEAD*** ----------
+        if self.drop_mask_ref:
+            mask_list = [self.drop_mask_ref.get(f"{self.layer_tag}_h{h:02d}", False) for h in range(attn.heads)]
+            if any(mask_list):
+                # True → head deve ser zerado
+                mask = torch.tensor(mask_list, device=query.device, dtype=query.dtype)
+                mask = mask.view(1, attn.heads, 1, 1)
+                query = query * (1.0 - mask)
+                key   = key   * (1.0 - mask)
+                value = value * (1.0 - mask)
+                
         # ----------   2) LOG do mapa – fora do autograd   ----------
         if self.logger is not None and torch.is_grad_enabled():
             with torch.no_grad():

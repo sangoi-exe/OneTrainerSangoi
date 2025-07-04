@@ -457,11 +457,16 @@ class TrainUI(ctk.CTk):
 
         row_index = 0
 
-        components.label(frame, row_index, 0, "Cross Attention Heatmaps", tooltip="Gera um heatmap da cross-attention a cada step conforme intervalo.")
-        components.switch(frame, row_index, 1, self.ui_state, "enable_cross_attn_maps_anal")
-
-        components.label(frame, row_index, 2, "Analyzer Epoch Interval", tooltip="Intervalo em epochs entre cada análise")
-        components.entry(frame, row_index, 3, self.ui_state, "analyzer_heatmap_interval")
+        components.label(frame, row_index, 0, "Cross Attention Maps", tooltip="Ativa a captura dos attention maps.")
+        components.switch(frame, row_index, 1, self.ui_state, "enable_cross_attn_cap")
+        row_index += 1
+        
+        components.label(frame, row_index, 0, "Enable Attention Heatmaps", tooltip="Gera um heatmap da cross-attention a cada step conforme intervalo.")
+        components.switch(frame, row_index, 1, self.ui_state, "analyzer_enable_heatmaps")
+        row_index += 1
+        
+        components.label(frame, row_index, 0, "Analyzer Epoch Interval", tooltip="Intervalo em epochs entre cada análise")
+        components.entry(frame, row_index, 1, self.ui_state, "analyzer_interval")
         row_index += 1
         
         components.label(frame, row_index, 0, "Token Grad Analyzer", tooltip="Analisar o gradiente dos tokens.")
