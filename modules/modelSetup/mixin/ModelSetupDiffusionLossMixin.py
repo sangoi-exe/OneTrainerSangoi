@@ -27,50 +27,15 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
   def __init__(self):
     super().__init__()
-    self.__align_prop_loss_fn = None
-    self.__alphas_cumprod_fun = None
     self.__coefficients = None
+    self.__alphas_cumprod_fun = None
     self.__sigmas = None
+
     self.tensorboard = None
     self.progress = None
     self.config = None
     self.loss_tracker = LossTracker()
     self.dynamic_loss_strengthing = DynamicLossControl()
-
-  def __align_prop_losses(
-    self,
-    batch: dict,
-    data: dict,
-    config: TrainConfig,
-    train_device: torch.device,
-  ):
-    if self.__align_prop_loss_fn is None:
-      dtype = data["predicted"].dtype
-
-      match config.align_prop_loss:
-        case AlignPropLoss.HPS:
-          self.__align_prop_loss_fn = HPSv2ScoreModel(dtype)
-        case AlignPropLoss.AESTHETIC:
-          self.__align_prop_loss_fn = AestheticScoreModel()
-
-      self.__align_prop_loss_fn.to(device=train_device, dtype=dtype)
-      self.__align_prop_loss_fn.requires_grad_(False)
-      self.__align_prop_loss_fn.eval()
-
-    losses = 0
-
-    match config.align_prop_loss:
-      case AlignPropLoss.HPS:
-        with torch.autocast(
-          device_type=train_device.type, dtype=data["predicted"].dtype
-        ):
-          losses = self.__align_prop_loss_fn(
-            data["predicted"], batch["prompt"], train_device
-          )
-      case AlignPropLoss.AESTHETIC:
-        losses = self.__align_prop_loss_fn(data["predicted"])
-
-    return losses * config.align_prop_weight
 
   def __log_cosh_loss(
       self,
@@ -80,16 +45,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     diff = pred - target
     loss = diff + torch.nn.functional.softplus(-2.0*diff) - torch.log(torch.full(size=diff.size(), fill_value=2.0, dtype=torch.float32, device=diff.device))
     return loss
-  # def __log_cosh_loss( # gambiarra pra testar charbonier
-  #     self,
-  #     pred: torch.Tensor,
-  #     target: torch.Tensor,
-  #     eps: float = 1e-3,
-  #     alpha: float = 0.5,  # 0.5 = raiz -> Charbonnier clássico
-  # ) -> torch.Tensor:
-  #     diff = pred - target
-  #     # (diff² + eps²)^(alpha)
-  #     return torch.pow(diff.square().add_(eps * eps), alpha)	
 
   def __masked_losses(
       self,
@@ -97,51 +52,66 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
       data: dict,
       config: TrainConfig,
   ):
-    #attention_entropy = self.token_analyzer.get_current_attention_entropy()
-    progress = self.progress
     losses = 0
+    mean_dim = list(range(1, data['predicted'].ndim))
+    
+    progress = self.progress
 
-    mse_loss = torch.tensor(0.0, device=data["predicted"].device)
-    mae_loss = torch.tensor(0.0, device=data["predicted"].device)
-    log_cosh_loss = torch.tensor(0.0, device=data["predicted"].device)
+    latent_mask: Tensor = batch["latent_mask"]
+    predicted: Tensor = data["predicted"]
+    target: Tensor = data["target"]
 
+    latent_mask = latent_mask.to(torch.float32)
+    predicted = predicted.to(torch.float32)
+    target = target.to(torch.float32)
+
+    mse_loss = torch.tensor(0.0, device=predicted.device)
+    mae_loss = torch.tensor(0.0, device=predicted.device)
+    log_cosh_loss = torch.tensor(0.0, device=predicted.device)
+
+
+    mask = self.prepare_mask(latent_mask, predicted)
+
+    predicted = predicted * mask
+    target = target * mask
+    
     # MSE/L2 Loss
     if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
       mse_loss = masked_losses(
         losses=F.mse_loss(
-          data["predicted"].to(dtype=torch.float32),
-          data["target"].to(dtype=torch.float32),
+          predicted,
+          target,
           reduction="none",
         ),
-        mask=batch["latent_mask"].to(dtype=torch.float32),
+        mask=mask,
         unmasked_weight=config.unmasked_weight,
         normalize_masked_area_loss=config.normalize_masked_area_loss,
-      ).mean([1, 2, 3])
+      ).mean(mean_dim)
 
     # MAE/L1 Loss
     if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
       mae_loss = masked_losses(
         losses=F.l1_loss(
-          data["predicted"].to(dtype=torch.float32),
-          data["target"].to(dtype=torch.float32),
+          predicted,
+          target,
           reduction="none",
         ),
-        mask=batch["latent_mask"].to(dtype=torch.float32),
+        mask=mask,
         unmasked_weight=config.unmasked_weight,
         normalize_masked_area_loss=config.normalize_masked_area_loss,
-      ).mean([1, 2, 3])
+      ).mean(mean_dim)
 
     # log-cosh Loss
     if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
       log_cosh_loss = masked_losses(
         losses=self.__log_cosh_loss(
-          data["predicted"].to(dtype=torch.float32),
-          data["target"].to(dtype=torch.float32),
+          predicted,
+          target,
         ),
-        mask=batch["latent_mask"].to(dtype=torch.float32),
+        mask=mask,
         unmasked_weight=config.unmasked_weight,
         normalize_masked_area_loss=config.normalize_masked_area_loss,
-      ).mean([1, 2, 3])
+      ).mean(mean_dim)
 
     match config.loss_mode_fn:
       case config.loss_mode_fn.ORIGINAL:
@@ -183,20 +153,20 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
           + mae_loss * mae_weight * config.mae_strength
           + log_cosh_loss * log_cosh_weight * config.log_cosh_strength
         )
-
+        
         if self.tensorboard != None:
           self.tensorboard.add_scalar(
-            "sangoi/7mse",
+            "sangoi/3mse",
             mse_weight,
             progress.global_step,
           )
           self.tensorboard.add_scalar(
-            "sangoi/8mae",
+            "sangoi/4mae",
             mae_weight,
             progress.global_step,
           )
           self.tensorboard.add_scalar(
-            "sangoi/9log_cosh",
+            "sangoi/5log_cosh",
             log_cosh_weight,
             progress.global_step,
           )
@@ -223,33 +193,31 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
       data: dict,
       config: TrainConfig,
   ):
-    #attention_entropy = self.token_analyzer.get_current_attention_entropy()
-    progress = self.progress
     losses = 0
+    mean_dim = list(range(1, data['predicted'].ndim))
+    progress = self.progress
 
-    mse_loss = torch.tensor(0.0, device=data["predicted"].device)
-    mae_loss = torch.tensor(0.0, device=data["predicted"].device)
-    log_cosh_loss = torch.tensor(0.0, device=data["predicted"].device)
+    predicted: Tensor = data["predicted"]
+    target: Tensor = data["target"]
 
-    predicted = data["predicted"].to(torch.float32)
-    target    = data["target"].to(torch.float32)
+    predicted = predicted.to(torch.float32)
+    target = target.to(torch.float32)
 
-    if config.masked_training:
-        mask = self.prepare_mask(batch["latent_mask"], predicted)  # float 0-1
-        predicted = predicted * mask
-        target    = target    * mask
+    mse_loss: Tensor = torch.tensor(0.0, device=predicted.device)
+    mae_loss: Tensor = torch.tensor(0.0, device=predicted.device)
+    log_cosh_loss: Tensor = torch.tensor(0.0, device=predicted.device)
 
     # MSE/L2 Loss
     if config.mse_strength != 0 or config.loss_mode_fn == "SANGOI":
-        mse_loss = F.mse_loss(predicted, target, reduction="none").mean([1, 2, 3])
+        mse_loss = F.mse_loss(predicted, target, reduction="none").mean(mean_dim)
 
     # MAE/L1 Loss
     if config.mae_strength != 0 or config.loss_mode_fn == "SANGOI":
-        mae_loss = F.l1_loss(predicted, target, reduction="none").mean([1, 2, 3])
+        mae_loss = F.l1_loss(predicted, target, reduction="none").mean(mean_dim)
 
     # log-cosh Loss
     if config.log_cosh_strength != 0 or config.loss_mode_fn == "SANGOI":
-        log_cosh_loss = self.__log_cosh_loss(predicted, target).mean([1, 2, 3])
+        log_cosh_loss = self.__log_cosh_loss(predicted, target).mean(mean_dim)
     
     match config.loss_mode_fn:
         case config.loss_mode_fn.ORIGINAL:
@@ -308,25 +276,25 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                   log_cosh_weight,
                   progress.global_step,
                 )
-    
-    mask_mean = batch["latent_mask"].mean((1,2,3)) 
-    losses /= mask_mean
+                
+    if config.masked_training and config.normalize_masked_area_loss:
+        clamped_mask = torch.clamp(batch['latent_mask'], config.unmasked_weight, 1)
+        mask_mean = clamped_mask.mean(mean_dim)
+        losses /= mask_mean
 
     return losses
 
-  def __snr(self, timesteps: Tensor, device: torch.device):
-    if self.__coefficients:
-      all_snr = (
-        self.__coefficients.sqrt_alphas_cumprod
-        / self.__coefficients.sqrt_one_minus_alphas_cumprod
-      ) ** 2
-      all_snr.to(device)
-      snr = all_snr[timesteps]
-    else:
-      alphas_cumprod = self.__alphas_cumprod_fun(timesteps, 1)
-      snr = alphas_cumprod / (1.0 - alphas_cumprod)
+  def __snr(self, timesteps: Tensor, device: torch.device) -> Tensor:
+      if self.__coefficients:
+          all_snr = (self.__coefficients.sqrt_alphas_cumprod /
+                      self.__coefficients.sqrt_one_minus_alphas_cumprod) ** 2
+          all_snr.to(device)
+          snr = all_snr[timesteps]
+      else:
+          alphas_cumprod = self.__alphas_cumprod_fun(timesteps, 1)
+          snr = alphas_cumprod / (1.0 - alphas_cumprod)
 
-    return snr
+      return snr
 
   def __min_snr_weight(
     self, timesteps: Tensor, gamma: float, v_prediction: bool, device: torch.device
@@ -374,9 +342,10 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
   def __sangoi_loss_weighting(
     self,
-    timesteps: Tensor,
+    timestep: Tensor,
     predicted: Tensor,
     target: Tensor,
+    latent_mask: Tensor,
     device: torch.device,
     tensorboard: SummaryWriter,
     gamma: float,
@@ -391,8 +360,16 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     config = self.config
 
     # 1) Cálculo do snr "padrão"
-    snr = self.__snr(timesteps, device)        # (batch, ...)
+    snr = self.__snr(timestep, device)
     epsilon = 1e-8
+
+    latent_mask = latent_mask.to(torch.float32)
+    predicted = predicted.to(torch.float32)
+    target = target.to(torch.float32)
+
+    mask = self.prepare_mask(latent_mask, predicted)
+    predicted = predicted * mask
+    target = target * mask
 
     # 2) Cálculo do MAPE (já presente)
     mape = torch.abs((target - predicted) / (target + epsilon))
@@ -454,27 +431,27 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     # 3) Reescalar [0,1] para [gamma,1]
     reward = gamma + (1.0 - gamma) * clamped_reward
 
-    # Logging no TensorBoard
-    tensorboard.add_scalar(
-      "sangoi/1mape_reward", mape_reward.mean().item(), progress.global_step
-    )
-    tensorboard.add_scalar(
-      "sangoi/2scenario_snr_weight", scenario_snr_weight.mean().item(), progress.global_step
-    )
-    tensorboard.add_scalar(
-      "sangoi/3clamped_reward", clamped_reward.mean().item(), progress.global_step
-    )
-    tensorboard.add_scalar(
-      "sangoi/4reward", reward.mean().item(), progress.global_step
-    )
-    tensorboard.add_scalar(
-      "sangoi/alpha", alpha, progress.global_step
-    )
-    tensorboard.add_scalar(
-      "sangoi/scenario_snr_weight_mean",
-      scenario_snr_weight.mean().item(),
-      progress.global_step,
-    )
+    # # Logging no TensorBoard
+    # tensorboard.add_scalar(
+    #   "sangoi/1mape_reward", mape_reward.mean().item(), progress.global_step
+    # )
+    # tensorboard.add_scalar(
+    #   "sangoi/2scenario_snr_weight", scenario_snr_weight.mean().item(), progress.global_step
+    # )
+    # tensorboard.add_scalar(
+    #   "sangoi/3clamped_reward", clamped_reward.mean().item(), progress.global_step
+    # )
+    # tensorboard.add_scalar(
+    #   "sangoi/4reward", reward.mean().item(), progress.global_step
+    # )
+    # tensorboard.add_scalar(
+    #   "sangoi/alpha", alpha, progress.global_step
+    # )
+    # tensorboard.add_scalar(
+    #   "sangoi/scenario_snr_weight_mean",
+    #   scenario_snr_weight.mean().item(),
+    #   progress.global_step,
+    # )
 
     return reward
 
@@ -483,9 +460,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     batch: dict,
     data: dict,
     config: TrainConfig,
+    train_device: torch.device,
     progress: TrainProgress,
     tensorboard: SummaryWriter,
-    train_device: torch.device,
     betas: Tensor | None = None,
     alphas_cumprod_fun: Callable[[Tensor, int], Tensor] | None = None,
   ) -> Tensor:
@@ -493,36 +470,26 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
     self.progress = progress
     self.config = config
     
-    loss_weight = batch["loss_weight"]
-
-    batch_size_scale = (
-      1
-      if config.loss_scaler in [LossScaler.NONE, LossScaler.GRADIENT_ACCUMULATION]
-      else config.batch_size
-    )
-    gradient_accumulation_steps_scale = (
-      1
-      if config.loss_scaler in [LossScaler.NONE, LossScaler.BATCH]
-      else config.gradient_accumulation_steps
-    )
+    loss_weight = batch['loss_weight']
+    batch_size_scale = \
+        1 if config.loss_scaler in [LossScaler.NONE, LossScaler.GRADIENT_ACCUMULATION] \
+            else config.batch_size
+    gradient_accumulation_steps_scale = \
+        1 if config.loss_scaler in [LossScaler.NONE, LossScaler.BATCH] \
+            else config.gradient_accumulation_steps
 
     if self.__coefficients is None and betas is not None:
-      self.__coefficients = DiffusionScheduleCoefficients.from_betas(betas)
+        self.__coefficients = DiffusionScheduleCoefficients.from_betas(betas)
 
     self.__alphas_cumprod_fun = alphas_cumprod_fun
 
-    if data["loss_type"] == "align_prop":
-      losses = self.__align_prop_losses(batch, data, config, train_device)
-    else:
-      # TODO: don't disable masked loss functions when has_conditioning_image_input is true.
-      #  This breaks if only the VAE is trained, but was loaded from an inpainting checkpoint
-      if (
-        config.masked_training
-        and not config.model_type.has_conditioning_image_input()
-      ):
-        losses = self.__masked_losses(batch, data, config)
-      else:
-        losses = self.__unmasked_losses(batch, data, config)
+    if data['loss_type'] == 'target':
+        # TODO: don't disable masked loss functions when has_conditioning_image_input is true.
+        #  This breaks if only the VAE is trained, but was loaded from an inpainting checkpoint
+        if config.masked_training and not config.model_type.has_conditioning_image_input():
+            losses = self.__masked_losses(batch, data, config)
+        else:
+            losses = self.__unmasked_losses(batch, data, config)
 
     # Scale Losses by Batch and/or GA (if enabled)
     losses = losses * batch_size_scale * gradient_accumulation_steps_scale
@@ -553,20 +520,21 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
           )
         case LossWeight.SANGOI:
           tensorboard.add_scalar(
-            "sangoi/5loss_b4_sangoi",
+            "sangoi/1loss_b4_sangoi",
             losses.mean().item(),
             self.progress.global_step,
           )
           losses *= self.__sangoi_loss_weighting(
-            data["timestep"],
-            data["predicted"],
-            data["target"],
+            data["timestep"].detach(),
+            data["predicted"].detach(),
+            data["target"].detach(),
+            batch["latent_mask"].detach(),
             losses.device,
             tensorboard,
             config.loss_weight_strength,
           )
           tensorboard.add_scalar(
-            "sangoi/6loss_after_sangoi",
+            "sangoi/2loss_after_sangoi",
             losses.mean().item(),
             self.progress.global_step,
           )

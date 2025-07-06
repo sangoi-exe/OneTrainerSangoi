@@ -86,7 +86,7 @@ class CapturingAttnProcessor:
         self.logger = logger
         self.fast = AttnProcessor2_0()
         self.layer_tag = layer_tag
-        self.drop_mask_ref = drop_mask_ref or {}        
+        self.drop_mask_ref = drop_mask_ref or {}
     def __call__(self,
                  attn: Attention,
                  hidden_states: torch.Tensor,

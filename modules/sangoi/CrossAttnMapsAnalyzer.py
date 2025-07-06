@@ -78,7 +78,10 @@ class CrossAttnMapsAnalyzer:
 
         self.templates: Dict[str, Dict[str, Any]] = {}
         self.rgb_cache: Dict[str, np.ndarray] = {}
+        self.positions_cache: Dict[str, Dict[int, List[int]]] = {}
         self._spatial_cache: Dict[Tuple[int,float], Tuple[int,int]] = {}
+        for q in (4096, 1024, 256, 64, 16):
+            self._spatial_cache[(q, round((64/q)**.5, 3))] = self._infer_spatial_dims(q, 1.0)
         self.alias2path = {}
         self.layer_aliases = []
         
@@ -91,41 +94,32 @@ class CrossAttnMapsAnalyzer:
     def path_to_alias(path: str) -> str:
         return path.replace('.', '_')
     
-    def update_strike_count(
-            self,
-            per_head_entropy: dict[str, float],
-            thr: float = 3.3,
-            consec_pat: int = 3,
-            total_pat: int = 12,
-        ) -> list[str]:
-        """
-        Atualiza strikes de cada head sob dois critérios:
-        1. consecutivos  – precisa de 'consec_pat' passos ruins seguidos
-        2. acumulados    – precisa de 'total_pat' passos ruins no total
+    def update_strike_count(self, per_head_entropy, thr=3.3, consec_pat=3, total_pat=12):
+        tags, vals = zip(*per_head_entropy.items())
+        vals = torch.tensor(vals)
+        killers = torch.tensor([self.drop_head_mask.get(t, False) for t in tags])
 
-        Se qualquer um dos critérios for atingido, devolve a tag.
-        """
-        killers = self.drop_head_mask
-        consec  = self.strikes_consec
-        total   = self.strikes_total
-        dead    = []
+        bad = (vals < thr) & ~killers
+        # Tensor de strikes consecutivos / totais
+        consec = torch.tensor([self.strikes_consec[t] for t in tags])
+        total  = torch.tensor([self.strikes_total [t] for t in tags])
 
-        for tag, ent in per_head_entropy.items():
-            if killers.get(tag):
-                continue
+        consec += bad.int()
+        total  += bad.int()
+        reset  = (~bad).int()
 
-            if ent < thr:
-                consec[tag] += 1
-                total[tag]  += 1
-            else:
-                consec[tag] = 0                      # zera sequência, mas mantém total
+        consec *= bad.int()  # zera quando não é bad
+        dead = (consec >= consec_pat) | (total >= total_pat)
 
-            if consec[tag] >= consec_pat or total[tag] >= total_pat:
-                dead.append(tag)
-                consec[tag] = 0                      # zera ambos após marcar
-                total[tag]  = 0
+        # write-back só nos que mudaram
+        for i, tag in enumerate(tags):
+            self.strikes_consec[tag] = int(consec[i])
+            self.strikes_total [tag] = int(total [i])
+            if dead[i]:
+                self.strikes_consec[tag] = 0
+                self.strikes_total [tag] = 0
 
-        return dead
+        return [t for t, d in zip(tags, dead) if d]
 
     def _reinit_heads(self, dead_tags, std: float = 0.01):
         """
@@ -242,33 +236,16 @@ class CrossAttnMapsAnalyzer:
 
         self._save_prompt_based_report(step, batch, grad_scores, "Gradient_Attribution")
 
-    def _analyze_attention_scores(self, maps, step: int, batch: Dict[str, Any]):
-        """
-        Calcula um score de atenção agregado por token, lidando com as diferentes
-        resoluções espaciais das camadas da UNet.
-        """
-        attn_maps_raw = maps
-        if not attn_maps_raw:
-            print(f"[TokenAnalyzer] SEM ATTENTION MAP PRO ANALYZE SCORES")
+    def _analyze_attention_scores(self, maps, step, batch):
+        if not maps:
+            print("[TokenAnalyzer] SEM ATTENTION MAP PRO ANALYZE SCORES")
             return
 
-        base_batch_size = batch['tokens_1'].shape[0]
-        layer_scores = []
-
-        for raw_map in attn_maps_raw:
-            # raw_map tem shape (B_eff, H, Q, K)
-            # B_eff é o batch que a UNet viu (provavelmente 2 com CFG)
-            cond_map = raw_map[:base_batch_size] # Pega a fatia condicional
-            score_per_token = cond_map.sum(dim=(0, 1, 2)) # Soma em B, H, Q -> Shape (K,)
-            layer_scores.append(score_per_token)
-
-        if not layer_scores: return
-
-        total_scores = torch.stack(layer_scores).sum(dim=0)
-        
-        if total_scores.ndim == 0:
-            print("[TokenAnalyzer] Scores de atenção agregados resultaram em um escalar. Pulando.")
-            return
+        B = batch['tokens_1'].shape[0]
+        total_scores = None
+        for raw in maps:
+            score = raw[:B].sum(dim=(0, 1, 2))          # (K,)
+            total_scores = score if total_scores is None else total_scores + score
 
         self._save_prompt_based_report(step, batch, total_scores, "Attention_Attribution")
 
@@ -315,10 +292,7 @@ class CrossAttnMapsAnalyzer:
                 map_avg_heads: Tensor = cond_map.mean(dim=1)
                 Q = map_avg_heads.shape[1]
                 # reconstrói H_lat×W_lat apenas para saber como desdobrar Q
-                key = (Q, aspect_ratio)
-                if key not in self._spatial_cache:
-                    self._spatial_cache[key] = self._infer_spatial_dims(Q, aspect_ratio)
-                current_h, current_w = self._spatial_cache[key]
+                current_h, current_w = self._infer_spatial_dims(Q, aspect_ratio)
                 if current_h == -1:
                     continue
 
@@ -354,6 +328,7 @@ class CrossAttnMapsAnalyzer:
 
             # --- resto do fluxo (gabarito, ordenação de tokens) ---
             concept_name = batch.get("concept_name", "default")[0]
+            img_key      = batch.get("image_path", [""])[0]
             current_token_ids = batch['tokens_2'][0]
 
             template = self.templates.get(img_key)
@@ -364,23 +339,16 @@ class CrossAttnMapsAnalyzer:
                     "txts": [self.tokenizer_g.decode(t) for t in current_token_ids],
                 }
                 template = self.templates[img_key]
-                print(f"[ANALYSIS] Gabarito salvo para '{img_key}' (step {step}).")
+                # print(f"[ANALYSIS] Gabarito salvo para '{img_key}' (step {step}).")
 
             # se tiver gabarito, usar
             if template is not None and concept_name != "orig":
                 # cria um mapa de posições para os tokens do prompt ATUAL.
                 # {token_id: [lista_de_indices_onde_ele_aparece]}
                 # ex: {123: [2, 15], 456: [8]}
-                # antes de tudo, veja se já existe no cache
-                if img_key in self.positions_cache:
-                    current_positions = self.positions_cache[img_key]
-                else:
-                    # monta mapa de token_id → índices
-                    current_positions: Dict[int,List[int]] = defaultdict(list)
-                    for idx, tid in enumerate(current_token_ids.tolist()):
-                        current_positions[tid].append(idx)
-                    # armazena para reutilizar nas próximas chamadas
-                    self.positions_cache[img_key] = current_positions
+                current_positions = defaultdict(list)
+                for idx, tid in enumerate(current_token_ids.tolist()):
+                    current_positions[tid].append(idx)
 
                 # 2. Constrói os dados ordenados para a plotagem.
                 ordered_token_ids_list = []

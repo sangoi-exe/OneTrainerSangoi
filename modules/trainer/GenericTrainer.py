@@ -861,7 +861,7 @@ class GenericTrainer(BaseTrainer):
                     if pooled_output_g is not None:
                         pooled_output_g.requires_grad_(True)
 
-                with TorchMemoryRecorder(enabled=False):                    
+                with TorchMemoryRecorder(enabled=False):
                     is_analyze_step = False
                     if self.cross_attn_anal: # verificar se o analyzer tá ativado
                         capture_attn_now = self.cross_attn_anal.analyzer_interval > 0 and \
@@ -887,7 +887,7 @@ class GenericTrainer(BaseTrainer):
                         loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config, train_progress, self.tensorboard)
 
                         # clona os maps pra uma variável separada
-                        maps_from_forward = self.cross_attn_anal.map_logger.get_maps().copy() # .copy() é crucial
+                        maps_from_forward = tuple(self.cross_attn_anal.map_logger.get_maps())
 
                         # limpa o map_logger, nem sei se precisa, porque vai ser usado a variável maps_from_forward
                         self.cross_attn_anal.map_logger.clear()
