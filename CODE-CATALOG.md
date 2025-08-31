@@ -64,3 +64,65 @@ Lista de arquivos ligados à pipeline de treino do Stable Diffusion XL (SDXL) ne
 - `src/diffusers/tests/single_file/test_stable_diffusion_xl_controlnet_single_file.py` – testes de ControlNet SDXL.
 - `src/diffusers/tests/lora/test_lora_layers_sdxl.py` – testes de camadas LoRA para SDXL.
 
+## Fluxo de Treino LoRA/DoRA – Funções Principais
+
+- `modules/trainer/BaseTrainer.py` – interface base de treinamento.
+  - `__init__(config, callbacks, commands)` – define dispositivos e objetos centrais.
+  - `start()`, `train()`, `end()`, `backup(train_progress)` – ganchos abstratos.
+  - `create_model_loader()`, `create_model_setup()`, `create_data_loader()`,
+    `create_model_saver()`, `create_model_sampler()` – fábricas de componentes.
+- `modules/trainer/GenericTrainer.py` – loop genérico de treinamento.
+  - `_handle_pause_logic()` – move o modelo para CPU e aguarda retomada.
+  - `start()` – carrega modelo, dataloaders e dispara o treino.
+  - `train()` – laço principal com gradiente acumulado, hooks de gradiente e amostragens.
+  - `backup()` e `end()` – salvam checkpoints e finalizam o processo.
+- `modules/modelLoader/StableDiffusionXLLoRAModelLoader.py`
+  - `_default_model_spec_name(model_type)` – escolhe o spec padrão.
+  - `load(model_type, model_names, weight_dtypes)` – carrega modelo base, LoRA e embeddings.
+- `modules/model/StableDiffusionXLModel.py`
+  - Funções de movimentação: `vae_to`, `text_encoder_to`, `unet_to`, `to` e `eval`.
+  - `create_pipeline()` – monta a pipeline do diffusers.
+  - `encode_text(...)` – tokeniza e codifica texto com dropout opcional.
+- `modules/module/LoRAModule.py`
+  - `PeftBase` com `hook_to_module()` e `make_weight()` para injeção de pesos.
+  - `LoRAModule` e `DoRAModule` – implementações das camadas adaptativas.
+  - `LoRAModuleWrapper` – cria, move e coleta os módulos LoRA/DoRA.
+- `modules/modelSetup/BaseStableDiffusionXLSetup.py`
+  - `setup_optimizations()` – aplica otimizações de memória/atenção.
+  - `_setup_additional_embeddings()` e `_setup_embedding_wrapper()` – configuram embeddings extras.
+  - `predict()` – gera ruído/latente e dados auxiliares do modelo.
+  - `calculate_loss()` – delega cálculo de loss para o mixin correspondente.
+- `modules/modelSetup/StableDiffusionXLLoRASetup.py`
+  - `_register_group()` e `_classify_unet_param()` – agrupam parâmetros LoRA.
+  - `create_parameters()` – monta grupos de parâmetros para o otimizador.
+  - `setup_model()` – cria wrappers LoRA para UNet e text encoders.
+  - `setup_train_device()` e `after_optimizer_step()` – controlam dispositivos e gradientes.
+- `modules/modelSetup/mixin/ModelSetupDiffusionLossMixin.py` – mixin de cálculo de perdas.
+  - `__log_cosh_loss()`, `__masked_losses()`, `__unmasked_losses()`.
+  - Funções de ponderação: `__min_snr_weight()`, `__p2_loss_weight()`, `__sigma_loss_weight()`,
+    `__sangoi_loss_weighting()`.
+  - `_diffusion_losses()` e `_flow_matching_losses()` – retornam o tensor de loss final.
+- `modules/modelSetup/mixin/ModelSetupNoiseMixin.py`
+  - `_create_noise()` – gera ruído a partir do scheduler.
+  - `_get_timestep_discrete()` / `_get_timestep_continuous()` – convertem timesteps.
+- `modules/modelSetup/mixin/ModelSetupDiffusionMixin.py`
+  - `_add_noise_discrete()` e `_add_noise_continuous()` – aplicam ruído ao latente.
+- `modules/modelSetup/mixin/ModelSetupEmbeddingMixin.py`
+  - `_create_new_embedding()` e `_add_embedding_to_tokenizer()` – gerenciam embeddings customizados.
+- `modules/modelSetup/mixin/ModelSetupDebugMixin.py`
+  - `_save_image()`, `_save_text()` e `_project_latent_to_image_sdxl()` – utilidades de depuração.
+- `modules/dataLoader/StableDiffusionXLBaseDataLoader.py`
+  - `create_dataset()` – compõe módulos do MGDS para preparar lotes.
+  - `_preparation_modules()`, `_cache_modules()`, `_debug_modules()` – estágios do pipeline.
+- `modules/dataLoader/mixin/DataLoaderText2ImageMixin.py`
+  - `_enumerate_input_modules()`, `_load_input_modules()` – leitura de imagens e prompts.
+  - `_mask_augmentation_modules()` e `_augmentation_modules()` – augmentações.
+  - `_output_modules_from_out_names()` – ordena e produz dados finais.
+- `modules/modelSampler/StableDiffusionXLSampler.py`
+  - `__sample_base()` / `__sample_inpainting()` – rotinas de denoising.
+  - `sample()` – expõe interface única de amostragem.
+- `modules/modelSaver/stableDiffusionXL/StableDiffusionXLLoRASaver.py`
+  - `__get_state_dict()` – agrega pesos LoRA e embeddings.
+  - `__save_ckpt()`, `__save_safetensors()`, `__save_internal()` – diferentes formatos de saída.
+  - `save()` – ponto de entrada para salvar o modelo treinado.
+
