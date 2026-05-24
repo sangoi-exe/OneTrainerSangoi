@@ -248,11 +248,8 @@ class TrainConfig(BaseConfig):
     lora_generate_keys_file: bool
     lora_module_overrides: str
     bucket_ratio: int
-    huber_strength: float
     charbonier_strength: float
-    parameters_by_module: bool
     enable_token_grad_analyzer: bool
-    param_group_strategy: str # module | block | stage | type | stage_type | block_type
     dora_paper_calc: bool
 
     loss_tracker_window: int
@@ -747,19 +744,15 @@ class TrainConfig(BaseConfig):
         data.append(("include_train_config", ConfigPart.NONE, ConfigPart, False))
         
         # sangoi settings
-        data.append(("parameters_by_module", False, bool, False))
         data.append(("enable_token_grad_analyzer", False, bool, False))
-        data.append(("param_group_strategy", "module", str, False))
         data.append(("loss_tracker_window", 100, int, False))
         data.append(("loss_tracker_use_mad", False, bool, False))
         data.append(("dls_use_ema", False, bool, False))
         data.append(("dls_ema_decay", 0.9, float, False))
         data.append(("dls_outlier_threshold", 3.0, float, False))
-        data.append(("huber_strength", 0.0, float, False))
         data.append(("charbonier_strength", 0.0, float, False))
-        data.append(("dyloco_params", [], list[DyLoCoConfig], True))
-        data.append(("lora_generate_keys_file", False, bool, False))
         data.append(("lora_module_overrides", "", str, False))
+        data.append(("dyloco_params", [], list[DyLoCoConfig], True))
         data.append(("bucket_ratio", 64, int, False))
         data.append(("dora_paper_calc", False, bool, False))
 

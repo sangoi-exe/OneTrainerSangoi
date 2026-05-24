@@ -10,7 +10,7 @@ class LossTracker:
     It can use mean/std or median/MAD for statistics.
     """
 
-    def __init__(self, window_size: int = 100, use_mad: bool = True) -> None:
+    def __init__(self, window_size: int = 100, use_mad: bool = False) -> None:
         """
         Initializes the LossTracker.
 
@@ -18,8 +18,6 @@ class LossTracker:
             window_size (int): The number of recent loss values to track.
             use_mad (bool): If True, use median and MAD instead of mean and std.
         """
-
-
         self.window_size: int = window_size
         self.use_mad: bool = use_mad
 
@@ -99,8 +97,8 @@ class DynamicLossControl:
 
     def __init__(
         self,
-        use_ema: bool = True,
-        ema_decay: float = 0.7,
+        use_ema: bool = False,
+        ema_decay: float = 0.9,
         outlier_threshold: float = 3.0,
         schedule_params: Dict[str, Dict[str, float]] = None,
     ) -> None:

@@ -906,7 +906,6 @@ class GenericTrainer(BaseTrainer):
             if self.model.ema:
                 self.model.ema.copy_ema_to(self.parameters, store_temp=False)
 
-
             # toma bem no meio do cu do nerogar, tem função de save até dentro do rabo dele
             # aí tive que fazer uma gambiarra aqui pra evitar que um safetensor seja sobrescrito
             # esse doente consegue ser muito inteligente por criar o OT, mas um ANIMAL por não prever esse tipo de coisa
